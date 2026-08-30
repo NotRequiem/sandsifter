@@ -27,7 +27,7 @@ import code
 import copy
 from ctypes import *
 
-INJECTOR = "./injector"
+INJECTOR = "./injector.exe" if os.name == 'nt' or os.path.exists("./injector.exe") else "./injector"
 arch = ""
 
 OUTPUT = "./data/"
@@ -811,13 +811,18 @@ def main():
 	if not os.path.exists(OUTPUT):
 	    os.makedirs(OUTPUT)
 
-	injector_bitness, errors = \
-	    subprocess.Popen(
-	            ['file', INJECTOR],
-	            stdout=subprocess.PIPE,
-	            stderr=subprocess.PIPE
-	            ).communicate()
-	arch = "64"
+	global arch
+    if os.name == 'nt':
+        import struct
+        arch = "64" if struct.calcsize("P") * 8 == 64 else "32"
+    else:
+        injector_bitness, errors = \
+            subprocess.Popen(
+                ['file', INJECTOR],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+                ).communicate()
+        arch = re.search(r".*(..)-bit.*", str(injector_bitness)).group(1)
 
 	ts = ThreadState()
 	signal.signal(signal.SIGINT, exit_handler)
