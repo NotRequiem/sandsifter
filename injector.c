@@ -174,66 +174,45 @@ result_t result;
 disas_t disas;
 
 typedef struct {
-	const uint8_t* opcode;
+	uint8_t* opcode;
 	int len;
-	const char* reason;
+	char* reason;
 } ignore_op_t;
 
 ignore_op_t opcode_blacklist[MAX_BLACKLIST] = {
-	{ (const uint8_t*)"\x0f\x34", 2, "sysenter" },
-	{ (const uint8_t*)"\x0f\xa1", 2, "pop fs" },
-	{ (const uint8_t*)"\x0f\xa9", 2, "pop gs" },
-	{ (const uint8_t*)"\x8e",     1, "mov seg" },
-	{ (const uint8_t*)"\xc8",     1, "enter" },
+	{ (uint8_t*)"\x0f\x34", 2, "sysenter" },
+	{ (uint8_t*)"\x0f\xa1", 2, "pop fs" },
+	{ (uint8_t*)"\x0f\xa9", 2, "pop gs" },
+	{ (uint8_t*)"\x8e",     1, "mov seg" },
+	{ (uint8_t*)"\xc8",     1, "enter" },
 #if !ARCH_X64
-	{ (const uint8_t*)"\xc5",     1, "lds" },
-	{ (const uint8_t*)"\xc4",     1, "les" },
+	{ (uint8_t*)"\xc5",     1, "lds" },
+	{ (uint8_t*)"\xc4",     1, "les" },
 #endif
-	{ (const uint8_t*)"\x0f\xb2", 2, "lss" },
-	{ (const uint8_t*)"\x0f\xb4", 2, "lfs" },
-	{ (const uint8_t*)"\x0f\xb5", 2, "lgs" },
+	{ (uint8_t*)"\x0f\xb2", 2, "lss" },
+	{ (uint8_t*)"\x0f\xb4", 2, "lfs" },
+	{ (uint8_t*)"\x0f\xb5", 2, "lgs" },
 #if ARCH_X64
-	{ (const uint8_t*)"\x63",     1, "movsxd" }, 
+	{ (uint8_t*)"\x63",     1, "movsxd" }, 
 #endif
-	{ (const uint8_t*)"\xbc",     1, "mov sp" },
-	{ (const uint8_t*)"\xd1\xec", 2, "shr sp, 1" },
-	{ (const uint8_t*)"\xd1\xe4", 2, "shl sp, 1" },
-	{ (const uint8_t*)"\xd1\xfc", 2, "sar sp, 1" },
-	{ (const uint8_t*)"\xd1\xdc", 2, "rcr sp, 1" },
-	{ (const uint8_t*)"\xd1\xd4", 2, "rcl sp, 1" },
-	{ (const uint8_t*)"\xd1\xcc", 2, "ror sp, 1" },
-	{ (const uint8_t*)"\xd1\xc4", 2, "rol sp, 1" },
-	{ (const uint8_t*)"\x8d\xa2", 2, "lea sp" },
-	{ (const uint8_t*)"\xc7\xf8", 2, "xbegin" },
-	{ (const uint8_t*)"\xcd\x80", 2, "int 0x80" },
-	{ (const uint8_t*)"\x0f\x05", 2, "syscall" },
-	{ (const uint8_t*)"\x0f\xb9", 2, "ud2" },
-	{ (const uint8_t*)"\xc2",     1, "ret 0x0000" },
-
-	{ (const uint8_t*)"\x0f\x00", 2, "sldt/str/lldt/ltr" },
-	{ (const uint8_t*)"\x0f\x01", 2, "sgdt/sidt/lgdt/lidt/smsw/lmsw" },
-
+	{ (uint8_t*)"\xbc",     1, "mov sp" },
+	{ (uint8_t*)"\xd1\xec", 2, "shr sp, 1" },
+	{ (uint8_t*)"\xd1\xe4", 2, "shl sp, 1" },
+	{ (uint8_t*)"\xd1\xfc", 2, "sar sp, 1" },
+	{ (uint8_t*)"\xd1\xdc", 2, "rcr sp, 1" },
+	{ (uint8_t*)"\xd1\xd4", 2, "rcl sp, 1" },
+	{ (uint8_t*)"\xd1\xcc", 2, "ror sp, 1" },
+	{ (uint8_t*)"\xd1\xc4", 2, "rol sp, 1" },
+	{ (uint8_t*)"\x8d\xa2", 2, "lea sp" },
+	{ (uint8_t*)"\xc7\xf8", 2, "xbegin" },
+	{ (uint8_t*)"\xcd\x80", 2, "int 0x80" },
+	{ (uint8_t*)"\x0f\x05", 2, "syscall" },
+	{ (uint8_t*)"\x0f\xb9", 2, "ud2" },
+	{ (uint8_t*)"\xc2",     1, "ret 0x0000" },
+	{ (uint8_t*)"\x0f\x00", 2, "sldt/str/lldt/ltr" },
+	{ (uint8_t*)"\x0f\x01", 2, "sgdt/sidt/lgdt/lidt/smsw/lmsw" },
 	{ NULL, 0, NULL }
 };
-
-bool has_opcode(const uint8_t* op, int op_len)
-{
-	int i, j;
-	for (i = 0; i < MAX_INSN_LENGTH; i++) {
-		if (!is_prefix(inj.i.bytes[i])) {
-			if (i + op_len > MAX_INSN_LENGTH) {
-				return false;
-			}
-			for (j = 0; j < op_len; j++) {
-				if (inj.i.bytes[i + j] != op[j]) {
-					return false;
-				}
-			}
-			return true;
-		}
-	}
-	return false;
-}
 
 typedef struct {
 	char* prefix;
@@ -275,6 +254,22 @@ static int optopt = '?';
 
 extern char debug, resume, preamble_start, preamble_end;
 static int expected_length;
+
+bool is_prefix(uint8_t x);
+bool has_opcode(const uint8_t* op, int op_len);
+bool has_prefix(uint8_t* pre);
+void print_mc(FILE* f, int length);
+void give_result(FILE* f);
+int prefix_count(void);
+bool has_dup_prefix(void);
+void preamble(void);
+void inject(int insn_size);
+bool move_next_instruction(void);
+bool move_next_range(void);
+void init_config(int argc, char** argv);
+void pin_core(void);
+void tick(void);
+void pretext(void);
 
 int getopt(int argc, char* const argv[], const char* optstring)
 {
@@ -582,19 +577,19 @@ bool has_dup_prefix(void)
 	return false;
 }
 
-bool has_opcode(uint8_t* op)
+bool has_opcode(const uint8_t* op, int op_len)
 {
 	int i, j;
 	for (i = 0; i < MAX_INSN_LENGTH; i++) {
 		if (!is_prefix(inj.i.bytes[i])) {
-			j = 0;
-			do {
-				if (i + j >= MAX_INSN_LENGTH || op[j] != inj.i.bytes[i + j]) {
+			if (i + op_len > MAX_INSN_LENGTH) {
+				return false;
+			}
+			for (j = 0; j < op_len; j++) {
+				if (inj.i.bytes[i + j] != op[j]) {
 					return false;
 				}
-				j++;
-			} while (op[j]);
-
+			}
 			return true;
 		}
 	}
@@ -878,8 +873,6 @@ void init_inj(const insn_t* new_insn)
 	inj.last_len = -1;
 }
 
-void give_result(FILE* f);
-
 bool move_next_instruction(void)
 {
 	int i;
@@ -959,7 +952,7 @@ bool move_next_instruction(void)
 		}
 		i++;
 	}
-	
+
 	i = 0;
 	while (prefix_blacklist[i].prefix) {
 		if (has_prefix((uint8_t*)prefix_blacklist[i].prefix)) {
@@ -1208,18 +1201,18 @@ void init_config(int argc, char** argv)
 				while (opcode_blacklist[j].opcode) {
 					j++;
 				}
-				opcode_blacklist[j].opcode = malloc(strlen(optarg) / 2 + 1);
+				opcode_blacklist[j].opcode = (uint8_t*)malloc(strlen(optarg) / 2 + 1);
 				assert(opcode_blacklist[j].opcode);
 				i = 0;
 				while (optarg[i * 2] && optarg[i * 2 + 1]) {
 					unsigned int k;
 					sscanf(optarg + i * 2, "%02x", &k);
-					opcode_blacklist[j].opcode[i] = k;
+					opcode_blacklist[j].opcode[i] = (uint8_t)k;
 					i++;
 				}
-				opcode_blacklist[j].opcode[i] = '\0';
+				opcode_blacklist[j].len = i;
 				opcode_blacklist[j].reason = "user_blacklist";
-				opcode_blacklist[++j] = (ignore_op_t){NULL, NULL};
+				opcode_blacklist[++j] = (ignore_op_t){NULL, 0, NULL};
 				break;
 			case 'j':
 				sscanf(optarg, "%d", &config.jobs);
