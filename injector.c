@@ -679,6 +679,7 @@ void inject(int insn_size)
 	}
 
 #if ARCH_X64
+	void* dummy_sp = (void*)&dummy_stack.dummy_stack_lo;
 	__asm__ __volatile__ (
 		"mov %[rax], %%rax \n"
 		"mov %[rbx], %%rbx \n"
@@ -713,10 +714,11 @@ void inject(int insn_size)
 		  [r14]"m"(inject_state.r14),
 		  [r15]"m"(inject_state.r15),
 		  [rbp]"m"(inject_state.rbp),
-		  [rsp]"i"(&dummy_stack.dummy_stack_lo),
+		  [rsp]"r"(dummy_sp),
 		  [packet]"m"(packet)
 	);
 #else
+	void* dummy_sp = (void*)&dummy_stack.dummy_stack_lo;
 	__asm__ __volatile__ (
 		"mov %[eax], %%eax \n"
 		"mov %[ebx], %%ebx \n"
@@ -735,7 +737,7 @@ void inject(int insn_size)
 		  [esi]"m"(inject_state.esi),
 		  [edi]"m"(inject_state.edi),
 		  [ebp]"m"(inject_state.ebp),
-		  [esp]"i"(&dummy_stack.dummy_stack_lo),
+		  [esp]"r"(dummy_sp),
 		  [packet]"m"(packet)
 	);
 #endif
