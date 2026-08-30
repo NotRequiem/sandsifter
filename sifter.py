@@ -812,17 +812,17 @@ def main():
 	    os.makedirs(OUTPUT)
 
 	global arch
-    if os.name == 'nt':
-        import struct
-        arch = "64" if struct.calcsize("P") * 8 == 64 else "32"
-    else:
-        injector_bitness, errors = \
-            subprocess.Popen(
-                ['file', INJECTOR],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-                ).communicate()
-        arch = re.search(r".*(..)-bit.*", str(injector_bitness)).group(1)
+	    if os.name == 'nt':
+	        import struct
+	        arch = "64" if struct.calcsize("P") * 8 == 64 else "32"
+	    else:
+	        injector_bitness, errors = \
+	            subprocess.Popen(
+	                ['file', INJECTOR],
+	                stdout=subprocess.PIPE,
+	                stderr=subprocess.PIPE
+	                ).communicate()
+	        arch = re.search(r".*(..)-bit.*", str(injector_bitness)).group(1)
 
 	ts = ThreadState()
 	signal.signal(signal.SIGINT, exit_handler)
