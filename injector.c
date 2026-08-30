@@ -606,6 +606,26 @@ bool is_backward_branch(const uint8_t* b)
 
 bool is_rip_relative_write(const uint8_t* b)
 {
+#if USE_CAPSTONE
+	uint8_t* c_code = (uint8_t*)b;
+	size_t c_size = MAX_INSN_LENGTH;
+	uint64_t c_addr = 0x1000;
+	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &c_size, &c_addr, capstone_insn)) {
+		if (capstone_insn->detail) {
+			for (int op_i = 0; op_i < capstone_insn->detail->x86.op_count; op_i++) {
+				cs_x86_op* op_desc = &capstone_insn->detail->x86.operands[op_i];
+				if (op_desc->type == X86_OP_MEM) {
+					if (op_desc->mem.base == X86_REG_RIP || op_desc->mem.base == X86_REG_EIP || op_desc->mem.base == X86_REG_IP) {
+						if (op_desc->access & CS_AC_WRITE || op_i == 0) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+#endif
+
 #if ARCH_X64
 	int idx = 0;
 	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
@@ -633,6 +653,16 @@ bool is_rip_relative_write(const uint8_t* b)
 	if (modrm_idx >= 0 && modrm_idx < MAX_INSN_LENGTH) {
 		uint8_t modrm = b[modrm_idx];
 		if ((modrm & 0xc7) == 0x05) {
+			if (op == 0x0f) {
+				uint8_t op2 = b[idx + 1];
+				if (op2 >= 0x90 && op2 <= 0x9f) return true;
+				if (op2 == 0xab || op2 == 0xb3 || op2 == 0xbb || op2 == 0xba || 
+				    op2 == 0xc0 || op2 == 0xc1 || op2 == 0xb0 || op2 == 0xb1 || 
+				    op2 == 0xc7 || op2 == 0x11 || op2 == 0x29 || op2 == 0x2b) {
+					return true;
+				}
+			}
+
 			uint8_t base_op = op & ~1;
 			if (base_op == 0x00 || base_op == 0x08 || base_op == 0x10 || base_op == 0x18 ||
 			    base_op == 0x20 || base_op == 0x28 || base_op == 0x30 || base_op == 0x38 ||
