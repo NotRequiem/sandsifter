@@ -34,12 +34,11 @@
 #define SIGSEGV 11
 
 #define UD2_SIZE  2
-#define PAGE_SIZE 4096
+#define ARENA_SIZE (64 * 1024)
+#define ARENA_OFFSET (32 * 1024)
 #define TF        0x100
-#define USE_TF    false
 
 #define MAX_INSN_LENGTH 15
-#define JMP_LENGTH 16
 
 #define LINE_BUFFER_SIZE 256
 #define BUFFER_LINES 16
@@ -89,45 +88,8 @@ struct {
 search_mode_t mode = TUNNEL;
 output_t output = TEXT;
 
-#if ARCH_X64
-typedef struct {
-	uint64_t rax;
-	uint64_t rbx;
-	uint64_t rcx;
-	uint64_t rdx;
-	uint64_t rsi;
-	uint64_t rdi;
-	uint64_t r8;
-	uint64_t r9;
-	uint64_t r10;
-	uint64_t r11;
-	uint64_t r12;
-	uint64_t r13;
-	uint64_t r14;
-	uint64_t r15;
-	uint64_t rbp;
-	uint64_t rsp;
-} state_t;
-state_t inject_state = {0};
-#else
-typedef struct {
-	uint32_t eax;
-	uint32_t ebx;
-	uint32_t ecx;
-	uint32_t edx;
-	uint32_t esi;
-	uint32_t edi;
-	uint32_t ebp;
-	uint32_t esp;
-} state_t;
-state_t inject_state = {0};
-#endif
-
-void* packet_buffer = NULL;
+void* arena_buffer = NULL;
 char* packet = NULL;
-static int current_insn_size = 0;
-static int current_expected_len = 0;
-
 static uint8_t dummy_stack_area[65536] __attribute__ ((aligned(4096)));
 
 typedef struct {
@@ -180,50 +142,23 @@ typedef struct {
 	char* reason;
 } ignore_op_t;
 
+/* Minimal blacklist: Only instructions that destroy the OS kernel/TEB context */
 ignore_op_t opcode_blacklist[MAX_BLACKLIST] = {
 	{ (uint8_t*)"\x0f\x34", 2, "sysenter" },
 	{ (uint8_t*)"\x0f\x35", 2, "sysexit" },
 	{ (uint8_t*)"\x0f\x05", 2, "syscall" },
 	{ (uint8_t*)"\x0f\x07", 2, "sysret" },
-	{ (uint8_t*)"\x0f\xa1", 2, "pop fs" },
-	{ (uint8_t*)"\x0f\xa9", 2, "pop gs" },
-	{ (uint8_t*)"\x0f\xa0", 2, "push fs" },
-	{ (uint8_t*)"\x0f\xa8", 2, "push gs" },
 	{ (uint8_t*)"\x0f\x01\xf8", 3, "swapgs" },
-	{ (uint8_t*)"\x8e",     1, "mov seg" },
-	{ (uint8_t*)"\xcd",     1, "int imm8" },
-	{ (uint8_t*)"\xcc",     1, "int3" },
-	{ (uint8_t*)"\xce",     1, "into" },
-	{ (uint8_t*)"\xf1",     1, "icebp" },
-	{ (uint8_t*)"\xc8",     1, "enter" },
-#if !ARCH_X64
-	{ (uint8_t*)"\xc5",     1, "lds" },
-	{ (uint8_t*)"\xc4",     1, "les" },
-#endif
-	{ (uint8_t*)"\x0f\xb2", 2, "lss" },
-	{ (uint8_t*)"\x0f\xb4", 2, "lfs" },
-	{ (uint8_t*)"\x0f\xb5", 2, "lgs" },
-#if ARCH_X64
-	{ (uint8_t*)"\x63",     1, "movsxd" }, 
-#endif
-	{ (uint8_t*)"\xbc",     1, "mov sp" },
-	{ (uint8_t*)"\xd1\xec", 2, "shr sp, 1" },
-	{ (uint8_t*)"\xd1\xe4", 2, "shl sp, 1" },
-	{ (uint8_t*)"\xd1\xfc", 2, "sar sp, 1" },
-	{ (uint8_t*)"\xd1\xdc", 2, "rcr sp, 1" },
-	{ (uint8_t*)"\xd1\xd4", 2, "rcl sp, 1" },
-	{ (uint8_t*)"\xd1\xcc", 2, "ror sp, 1" },
-	{ (uint8_t*)"\xd1\xc4", 2, "rol sp, 1" },
-	{ (uint8_t*)"\x8d\xa2", 2, "lea sp" },
-	{ (uint8_t*)"\xc7\xf8", 2, "xbegin" },
+	{ (uint8_t*)"\x0f\xae\xd8", 3, "wrfsbase" },
+	{ (uint8_t*)"\x0f\xae\xd9", 3, "wrfsbase" },
+	{ (uint8_t*)"\x0f\xae\xda", 3, "wrfsbase" },
+	{ (uint8_t*)"\x0f\xae\xdb", 3, "wrfsbase" },
+	{ (uint8_t*)"\x0f\xae\xdc", 3, "wrgsbase" },
+	{ (uint8_t*)"\x0f\xae\xdd", 3, "wrgsbase" },
+	{ (uint8_t*)"\x0f\xae\xde", 3, "wrgsbase" },
+	{ (uint8_t*)"\x0f\xae\xdf", 3, "wrgsbase" },
 	{ (uint8_t*)"\x0f\xb9", 2, "ud2" },
-	{ (uint8_t*)"\xc2",     1, "ret imm16" },
-	{ (uint8_t*)"\xc3",     1, "ret" },
-	{ (uint8_t*)"\xca",     1, "retf imm16" },
-	{ (uint8_t*)"\xcb",     1, "retf" },
-	{ (uint8_t*)"\xcf",     1, "iret" },
-	{ (uint8_t*)"\x0f\x00", 2, "sldt/str/lldt/ltr" },
-	{ (uint8_t*)"\x0f\x01", 2, "sgdt/sidt/lgdt/lidt/smsw/lmsw" },
+	{ (uint8_t*)"\x0f\xaa", 2, "rsm" },
 	{ NULL, 0, NULL }
 };
 
@@ -233,10 +168,6 @@ typedef struct {
 } ignore_pre_t;
 
 ignore_pre_t prefix_blacklist[] = {
-#if !ARCH_X64
-	{ "\x65", "gs" },
-#endif
-	{ "\x64", "fs" },
 	{ NULL, NULL }
 };
 
@@ -270,16 +201,11 @@ static int expected_length;
 
 bool is_prefix(uint8_t x);
 bool has_opcode(const uint8_t* op, int op_len);
-bool has_prefix(uint8_t* pre);
-bool modifies_sp(const uint8_t* b);
-bool is_backward_branch(const uint8_t* b);
-bool is_rip_relative_write(const uint8_t* b);
-bool is_branch_insn(const uint8_t* b, int* branch_len);
 void print_mc(FILE* f, int length);
 void give_result(FILE* f);
 int prefix_count(void);
 bool has_dup_prefix(void);
-void inject(int insn_size);
+void inject(void);
 bool move_next_instruction(void);
 bool move_next_range(void);
 void init_config(int argc, char** argv);
@@ -422,14 +348,6 @@ bool increment_range(insn_t* insn, int marker)
 	return i >= 0;
 }
 
-void print_insn(FILE* f, insn_t* insn)
-{
-	int i;
-	for (i = 0; i < sizeof(insn->bytes); i++) {
-		sync_fprintf(f, "%02x", insn->bytes[i]);
-	}
-}
-
 void initialize_ranges(void)
 {
 	if (range_marker == NULL) {
@@ -500,15 +418,15 @@ int print_asm(FILE* f)
 	if (output == TEXT) {
 		uint8_t* code = inj.i.bytes;
 		size_t code_size = MAX_INSN_LENGTH;
-		uint64_t address = (uintptr_t)packet_buffer;
+		uint64_t address = (uintptr_t)packet;
 	
 		if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-			sync_fprintf(f, "%10s %-45s (%2d)", capstone_insn[0].mnemonic, capstone_insn[0].op_str, (int)(address - (uintptr_t)packet_buffer));
+			sync_fprintf(f, "%10s %-45s (%2d)", capstone_insn[0].mnemonic, capstone_insn[0].op_str, (int)(address - (uintptr_t)packet));
 		}
 		else {
-			sync_fprintf(f, "%10s %-45s (%2d)", "(unk)", " ", (int)(address - (uintptr_t)packet_buffer));
+			sync_fprintf(f, "%10s %-45s (%2d)", "(unk)", " ", (int)(address - (uintptr_t)packet));
 		}
-		expected_length = (int)(address - (uintptr_t)packet_buffer);
+		expected_length = (int)(address - (uintptr_t)packet);
 	}
 	return 0;
 }
@@ -532,229 +450,6 @@ bool is_prefix(uint8_t x)
 		|| (x >= 0x40 && x <= 0x4f)
 #endif
 		;
-}
-
-bool is_branch_insn(const uint8_t* b, int* branch_len)
-{
-	int idx = 0;
-	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
-	if (idx >= MAX_INSN_LENGTH) return false;
-
-	uint8_t op = b[idx];
-
-	if ((op >= 0x70 && op <= 0x7f) || op == 0xeb || (op >= 0xe0 && op <= 0xe3)) {
-		if (branch_len) *branch_len = idx + 2;
-		return true;
-	}
-
-	if (op == 0x0f && idx + 1 < MAX_INSN_LENGTH) {
-		uint8_t op2 = b[idx + 1];
-		if (op2 >= 0x80 && op2 <= 0x8f) {
-			if (branch_len) *branch_len = idx + 6;
-			return true;
-		}
-	}
-
-	if (op == 0xe9 || op == 0xe8) {
-		if (branch_len) *branch_len = idx + 5;
-		return true;
-	}
-
-	return false;
-}
-
-bool is_backward_branch(const uint8_t* b)
-{
-	int idx = 0;
-	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
-	if (idx >= MAX_INSN_LENGTH) return false;
-
-	uint8_t op = b[idx];
-
-	if ((op >= 0x70 && op <= 0x7f) || op == 0xeb || (op >= 0xe0 && op <= 0xe3)) {
-		if (idx + 1 < MAX_INSN_LENGTH) {
-			int8_t disp8 = (int8_t)b[idx + 1];
-			if (disp8 <= 0) {
-				return true;
-			}
-		}
-	}
-
-	if (op == 0x0f && idx + 1 < MAX_INSN_LENGTH) {
-		uint8_t op2 = b[idx + 1];
-		if (op2 >= 0x80 && op2 <= 0x8f) {
-			if (idx + 5 < MAX_INSN_LENGTH) {
-				int32_t disp32 = (int32_t)(b[idx + 2] | (b[idx + 3] << 8) | 
-				                          (b[idx + 4] << 16) | (b[idx + 5] << 24));
-				if (disp32 <= 0) {
-					return true;
-				}
-			}
-		}
-	}
-
-	if (op == 0xe9 && idx + 4 < MAX_INSN_LENGTH) {
-		int32_t disp32 = (int32_t)(b[idx + 1] | (b[idx + 2] << 8) | 
-		                          (b[idx + 3] << 16) | (b[idx + 4] << 24));
-		if (disp32 <= 0) {
-			return true;
-		}
-	}
-
-	return false;
-}
-
-bool is_rip_relative_write(const uint8_t* b)
-{
-#if USE_CAPSTONE
-	uint8_t* c_code = (uint8_t*)b;
-	size_t c_size = MAX_INSN_LENGTH;
-	uint64_t c_addr = 0x1000;
-	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &c_size, &c_addr, capstone_insn)) {
-		if (capstone_insn->detail) {
-			for (int op_i = 0; op_i < capstone_insn->detail->x86.op_count; op_i++) {
-				cs_x86_op* op_desc = &capstone_insn->detail->x86.operands[op_i];
-				if (op_desc->type == X86_OP_MEM) {
-					if (op_desc->mem.base == X86_REG_RIP || op_desc->mem.base == X86_REG_EIP || op_desc->mem.base == X86_REG_IP) {
-						if (op_desc->access & CS_AC_WRITE || op_i == 0) {
-							return true;
-						}
-					}
-				}
-			}
-		}
-	}
-#endif
-
-#if ARCH_X64
-	int idx = 0;
-	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
-	if (idx >= MAX_INSN_LENGTH) return false;
-	
-	uint8_t op = b[idx];
-	int modrm_idx = -1;
-
-	if (op == 0x0f) {
-		if (idx + 1 >= MAX_INSN_LENGTH) return false;
-		uint8_t op2 = b[idx + 1];
-		if (op2 == 0x38 || op2 == 0x3a) {
-			modrm_idx = idx + 3;
-		} else {
-			modrm_idx = idx + 2;
-		}
-	} else if (op == 0xc5) {
-		modrm_idx = idx + 2;
-	} else if (op == 0xc4 || op == 0x8f || op == 0x62) {
-		modrm_idx = idx + 3;
-	} else {
-		modrm_idx = idx + 1;
-	}
-
-	if (modrm_idx >= 0 && modrm_idx < MAX_INSN_LENGTH) {
-		uint8_t modrm = b[modrm_idx];
-		if ((modrm & 0xc7) == 0x05) {
-			if (op == 0x0f) {
-				uint8_t op2 = b[idx + 1];
-				if (op2 >= 0x90 && op2 <= 0x9f) return true;
-				if (op2 == 0xab || op2 == 0xb3 || op2 == 0xbb || op2 == 0xba || 
-				    op2 == 0xc0 || op2 == 0xc1 || op2 == 0xb0 || op2 == 0xb1 || 
-				    op2 == 0xc7 || op2 == 0x11 || op2 == 0x29 || op2 == 0x2b) {
-					return true;
-				}
-			}
-
-			uint8_t base_op = op & ~1;
-			if (base_op == 0x00 || base_op == 0x08 || base_op == 0x10 || base_op == 0x18 ||
-			    base_op == 0x20 || base_op == 0x28 || base_op == 0x30 || base_op == 0x38 ||
-			    base_op == 0x88 || base_op == 0xc0 || base_op == 0xc6 ||
-			    (op >= 0xd0 && op <= 0xd3) || base_op == 0xf6 || base_op == 0xfe ||
-			    op == 0x86 || op == 0x87) {
-				return true;
-			}
-		}
-	}
-#endif
-	return false;
-}
-
-bool modifies_sp(const uint8_t* b)
-{
-#if USE_CAPSTONE
-	uint8_t* c_code = (uint8_t*)b;
-	size_t c_size = MAX_INSN_LENGTH;
-	uint64_t c_addr = 0x1000;
-	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &c_size, &c_addr, capstone_insn)) {
-		if (capstone_insn->detail) {
-			for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
-				uint16_t reg_w = capstone_insn->detail->regs_write[r];
-				if (reg_w == X86_REG_RSP || reg_w == X86_REG_ESP || reg_w == X86_REG_SP || reg_w == X86_REG_SPL) {
-					return true;
-				}
-			}
-			for (int op_i = 0; op_i < capstone_insn->detail->x86.op_count; op_i++) {
-				cs_x86_op* op_desc = &capstone_insn->detail->x86.operands[op_i];
-				if (op_desc->type == X86_OP_REG) {
-					if (op_desc->reg == X86_REG_RSP || op_desc->reg == X86_REG_ESP || 
-					    op_desc->reg == X86_REG_SP || op_desc->reg == X86_REG_SPL) {
-						if (op_desc->access & CS_AC_WRITE) {
-							return true;
-						}
-					}
-				}
-			}
-		}
-	}
-#endif
-
-	int idx = 0;
-	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
-	if (idx >= MAX_INSN_LENGTH) return false;
-	
-	uint8_t op = b[idx];
-
-	if ((op >= 0x50 && op <= 0x5f) || op == 0x68 || op == 0x6a || 
-	    op == 0x9c || op == 0x9d || op == 0xc2 || op == 0xc3 || 
-	    op == 0xc8 || op == 0xc9 || op == 0xca || op == 0xcb || 
-	    op == 0xcc || op == 0xcd || op == 0xce || op == 0xcf || 
-	    op == 0xe8 || op == 0xbc || op == 0x9a) {
-		return true;
-	}
-
-	int modrm_idx = -1;
-
-	if (op == 0x0f) {
-		if (idx + 1 >= MAX_INSN_LENGTH) return false;
-		uint8_t op2 = b[idx + 1];
-		if (op2 == 0x05 || op2 == 0x07 || op2 == 0x34 || op2 == 0x35 || 
-		    op2 == 0xa0 || op2 == 0xa1 || op2 == 0xa8 || op2 == 0xa9) return true;
-		
-		if (op2 == 0x38 || op2 == 0x3a) {
-			modrm_idx = idx + 3;
-		} else {
-			modrm_idx = idx + 2;
-		}
-	} 
-	else if (op == 0xc5) {
-		modrm_idx = idx + 2;
-	} 
-	else if (op == 0xc4 || op == 0x8f || op == 0x62) {
-		modrm_idx = idx + 3;
-	} 
-	else {
-		modrm_idx = idx + 1;
-	}
-
-	if (modrm_idx >= 0 && modrm_idx < MAX_INSN_LENGTH) {
-		uint8_t modrm = b[modrm_idx];
-		uint8_t reg = (modrm >> 3) & 0x07;
-		uint8_t rm = modrm & 0x07;
-		uint8_t mod = modrm & 0xc0;
-
-		if (reg == 4) return true;
-		if (mod == 0xc0 && rm == 4) return true;
-	}
-
-	return false;
 }
 
 void print_mc(FILE* f, int length)
@@ -828,38 +523,9 @@ bool has_opcode(const uint8_t* op, int op_len)
 	return false;
 }
 
-bool has_prefix(uint8_t* pre)
+void inject(void)
 {
-	int i, j;
-	for (i = 0; i < MAX_INSN_LENGTH; i++) {
-		if (is_prefix(inj.i.bytes[i])) {
-			j = 0;
-			do {
-				if (inj.i.bytes[i] == pre[j]) {
-					return true;
-				}
-				j++;
-			} while (pre[j]);
-		}
-		else {
-			return false;
-		}
-	}
-	return false;
-}
-
-void inject(int insn_size)
-{
-	int i;
-	current_insn_size = insn_size;
-
-	memset(packet_buffer, 0xCC, PAGE_SIZE * 2);
-
-	packet = (char*)packet_buffer;
-
-	for (i = 0; i < insn_size && i < MAX_INSN_LENGTH; i++) {
-		((char*)packet)[i] = inj.i.bytes[i];
-	}
+	memcpy(packet, inj.i.bytes, MAX_INSN_LENGTH);
 
 	if (!have_state) {
 		__asm__ __volatile__ ("ud2\n\t");
@@ -870,32 +536,38 @@ void inject(int insn_size)
 	__asm__ __volatile__ (
 		"movq packet(%rip), %r11 \n\t"
 		"leaq dummy_stack_area+32768(%rip), %rsp \n\t"
-		"movq inject_state+0(%rip),  %rax \n\t"
-		"movq inject_state+8(%rip),  %rbx \n\t"
-		"movq inject_state+16(%rip), %rcx \n\t"
-		"movq inject_state+24(%rip), %rdx \n\t"
-		"movq inject_state+32(%rip), %rsi \n\t"
-		"movq inject_state+40(%rip), %rdi \n\t"
-		"movq inject_state+48(%rip), %r8  \n\t"
-		"movq inject_state+56(%rip), %r9  \n\t"
-		"movq inject_state+64(%rip), %r10 \n\t"
-		"movq inject_state+80(%rip), %r12 \n\t"
-		"movq inject_state+88(%rip), %r13 \n\t"
-		"movq inject_state+96(%rip), %r14 \n\t"
-		"movq inject_state+104(%rip), %r15 \n\t"
-		"movq inject_state+112(%rip), %rbp \n\t"
+		"xorq %rax, %rax \n\t"
+		"xorq %rbx, %rbx \n\t"
+		"xorq %rcx, %rcx \n\t"
+		"xorq %rdx, %rdx \n\t"
+		"xorq %rsi, %rsi \n\t"
+		"xorq %rdi, %rdi \n\t"
+		"xorq %r8,  %r8  \n\t"
+		"xorq %r9,  %r9  \n\t"
+		"xorq %r10, %r10 \n\t"
+		"xorq %r12, %r12 \n\t"
+		"xorq %r13, %r13 \n\t"
+		"xorq %r14, %r14 \n\t"
+		"xorq %r15, %r15 \n\t"
+		"xorq %rbp, %rbp \n\t"
+		"pushfq \n\t"
+		"orq $0x100, (%rsp) \n\t" /* Set Trap Flag (Single-Step) */
+		"popfq \n\t"
 		"jmp *%r11 \n\t"
 	);
 #else
 	__asm__ __volatile__ (
 		"movl packet, %edx \n\t"
 		"leal dummy_stack_area+32768, %esp \n\t"
-		"movl inject_state+0,  %eax \n\t"
-		"movl inject_state+4,  %ebx \n\t"
-		"movl inject_state+8,  %ecx \n\t"
-		"movl inject_state+16, %esi \n\t"
-		"movl inject_state+20, %edi \n\t"
-		"movl inject_state+24, %ebp \n\t"
+		"xorl %eax, %eax \n\t"
+		"xorl %ebx, %ebx \n\t"
+		"xorl %ecx, %ecx \n\t"
+		"xorl %esi, %esi \n\t"
+		"xorl %edi, %edi \n\t"
+		"xorl %ebp, %ebp \n\t"
+		"pushfl \n\t"
+		"orl $0x100, (%esp) \n\t" /* Set Trap Flag (Single-Step) */
+		"popfl \n\t"
 		"jmp *%edx \n\t"
 	);
 #endif
@@ -926,55 +598,46 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	uintptr_t fault_ip = (uintptr_t)pExceptionInfo->ContextRecord->Eip;
 #endif
 
-	int insn_length = (int)(fault_ip - (uintptr_t)packet);
-	if (insn_length < 0 || insn_length > MAX_INSN_LENGTH) {
-		insn_length = current_expected_len;
-	}
-
 	DWORD code = pExceptionInfo->ExceptionRecord->ExceptionCode;
 	uint32_t signum = 0;
 	uint32_t si_code = 0;
 	uint32_t addr = (uint32_t)-1;
+	int insn_length = 0;
 
-	switch (code) {
-		case EXCEPTION_BREAKPOINT:
-		case EXCEPTION_SINGLE_STEP:
-			signum = SIGTRAP;
-			si_code = 1;
-			insn_length = current_expected_len;
-			break;
-		case EXCEPTION_ILLEGAL_INSTRUCTION:
-		case EXCEPTION_PRIV_INSTRUCTION:
-			signum = SIGILL;
-			si_code = 1;
-			break;
-		case EXCEPTION_ACCESS_VIOLATION:
-		case EXCEPTION_IN_PAGE_ERROR:
-			signum = SIGSEGV;
-			si_code = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-			addr = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-			break;
-		case EXCEPTION_DATATYPE_MISALIGNMENT:
-			signum = SIGBUS;
-			si_code = 1;
-			addr = (uint32_t)(uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionAddress;
-			break;
-		case EXCEPTION_FLT_DENORMAL_OPERAND:
-		case EXCEPTION_FLT_DIVIDE_BY_ZERO:
-		case EXCEPTION_FLT_INEXACT_RESULT:
-		case EXCEPTION_FLT_INVALID_OPERATION:
-		case EXCEPTION_FLT_OVERFLOW:
-		case EXCEPTION_FLT_STACK_CHECK:
-		case EXCEPTION_FLT_UNDERFLOW:
-		case EXCEPTION_INT_DIVIDE_BY_ZERO:
-		case EXCEPTION_INT_OVERFLOW:
-			signum = SIGFPE;
-			si_code = 1;
-			break;
-		default:
-			signum = SIGSEGV;
-			si_code = 0;
-			break;
+	if (code == EXCEPTION_SINGLE_STEP) {
+		/* Hardware successfully executed 1 instruction and single-stepped */
+		signum = SIGTRAP;
+		si_code = 1;
+		insn_length = (int)(fault_ip - (uintptr_t)packet);
+		if (insn_length <= 0 || insn_length > MAX_INSN_LENGTH) {
+			insn_length = expected_length;
+		}
+	}
+	else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION) {
+		signum = SIGILL;
+		si_code = 1;
+		insn_length = (int)(fault_ip - (uintptr_t)packet);
+	}
+	else if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
+		signum = SIGSEGV;
+		si_code = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+		addr = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
+		insn_length = (int)(fault_ip - (uintptr_t)packet);
+	}
+	else if (code == EXCEPTION_DATATYPE_MISALIGNMENT) {
+		signum = SIGBUS;
+		si_code = 1;
+		addr = (uint32_t)(uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionAddress;
+		insn_length = (int)(fault_ip - (uintptr_t)packet);
+	}
+	else {
+		signum = SIGFPE;
+		si_code = 1;
+		insn_length = (int)(fault_ip - (uintptr_t)packet);
+	}
+
+	if (insn_length <= 0 || insn_length > MAX_INSN_LENGTH) {
+		insn_length = expected_length > 0 ? expected_length : 1;
 	}
 
 	result.valid = 1;
@@ -983,6 +646,7 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	result.si_code = si_code;
 	result.addr = addr;
 
+	/* Restore baseline registers and jump to safe resume label */
 	*pExceptionInfo->ContextRecord = fault_context;
 	pExceptionInfo->ContextRecord->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
 #if ARCH_X64
@@ -1098,48 +762,10 @@ bool move_next_instruction(void)
 		}
 		search_range.started = true;
 
-		if (is_backward_branch(inj.i.bytes)) {
-			if (output == RAW) {
-				result = (result_t){0,0,0,0,0};
-				give_result(stdout);
-			}
-			continue;
-		}
-
-		if (is_rip_relative_write(inj.i.bytes)) {
-			if (output == RAW) {
-				result = (result_t){0,0,0,0,0};
-				give_result(stdout);
-			}
-			continue;
-		}
-
-		if (modifies_sp(inj.i.bytes)) {
-			if (output == RAW) {
-				result = (result_t){0,0,0,0,0};
-				give_result(stdout);
-			}
-			continue;
-		}
-
 		bool blacklisted = false;
 		i = 0;
 		while (opcode_blacklist[i].opcode) {
 			if (has_opcode(opcode_blacklist[i].opcode, opcode_blacklist[i].len)) {
-				if (output == RAW) {
-					result = (result_t){0,0,0,0,0};
-					give_result(stdout);
-				}
-				blacklisted = true;
-				break;
-			}
-			i++;
-		}
-		if (blacklisted) continue;
-
-		i = 0;
-		while (prefix_blacklist[i].prefix) {
-			if (has_prefix((uint8_t*)prefix_blacklist[i].prefix)) {
 				if (output == RAW) {
 					result = (result_t){0,0,0,0,0};
 					give_result(stdout);
@@ -1180,9 +806,6 @@ bool move_next_instruction(void)
 
 void give_result(FILE* f)
 {
-	uint8_t* code;
-	size_t code_size;
-	uint64_t address;
 	switch (output) {
 		case TEXT:
 			switch (mode) {
@@ -1208,41 +831,31 @@ void give_result(FILE* f)
 			break;
 		case RAW:
 #if USE_CAPSTONE
-			code = inj.i.bytes;
-			code_size = MAX_INSN_LENGTH;
-			address = (uintptr_t)packet_buffer;
-		
-			if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-#if RAW_REPORT_DISAS_MNE 
-				strncpy(disas.mne, capstone_insn[0].mnemonic, RAW_DISAS_MNEMONIC_BYTES);
-#endif
-#if RAW_REPORT_DISAS_OPS
-				strncpy(disas.ops, capstone_insn[0].op_str, RAW_DISAS_OP_BYTES);
-#endif
+			{
+				uint8_t* code = inj.i.bytes;
+				size_t code_size = MAX_INSN_LENGTH;
+				uint64_t address = (uintptr_t)packet;
+			
+				if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
 #if RAW_REPORT_DISAS_LEN
-				disas.len = (int)(address - (uintptr_t)packet_buffer);
+					disas.len = (int)(address - (uintptr_t)packet);
 #endif
 #if RAW_REPORT_DISAS_VAL
-				disas.val = true;
+					disas.val = true;
 #endif
-			}
-			else {
-#if RAW_REPORT_DISAS_MNE 
-				strncpy(disas.mne, "(unk)", RAW_DISAS_MNEMONIC_BYTES);
-#endif
-#if RAW_REPORT_DISAS_OPS
-				strncpy(disas.ops, " ", RAW_DISAS_OP_BYTES);
-#endif
+				}
+				else {
 #if RAW_REPORT_DISAS_LEN
-				disas.len = (int)(address - (uintptr_t)packet_buffer);
+					disas.len = (int)(address - (uintptr_t)packet);
 #endif
 #if RAW_REPORT_DISAS_VAL
-				disas.val = false;
+					disas.val = false;
 #endif
-			}
+				}
 #if RAW_REPORT_DISAS_MNE || RAW_REPORT_DISAS_OPS || RAW_REPORT_DISAS_LEN
-			sync_fwrite(&disas, sizeof(disas), 1, stdout);
+				sync_fwrite(&disas, sizeof(disas), 1, stdout);
 #endif
+			}
 #endif
 			sync_fwrite(inj.i.bytes, RAW_REPORT_INSN_BYTES, 1, stdout);
 			sync_fwrite(&result, sizeof(result), 1, stdout);
@@ -1253,86 +866,26 @@ void give_result(FILE* f)
 	sync_fflush(stdout, false);
 }
 
-void usage(void)
-{
-	printf("injector [-b|-r|-t|-d] [-R|-T] [-x] [-0] [-D] [-N]\n");
-	printf("\t[-s seed] [-B brute_depth] [-P max_prefix]\n");
-	printf("\t[-i instruction] [-e instruction]\n");
-	printf("\t[-c core] [-X blacklist]\n");
-	printf("\t[-j jobs] [-l range_bytes]\n");
-}
-
-void help(void)
-{
-	printf("injector [OPTIONS...]\n");
-	printf("\t[-b|-r|-t|-d] ....... mode: brute, random, tunnel, directed (default: tunnel)\n");
-	printf("\t[-R|-T] ............. output: raw, text (default: text)\n");
-	printf("\t[-x] ................ show tick (default: %d)\n", config.show_tick);
-	printf("\t[-0] ................ allow null dereference (default: %d)\n", config.enable_null_access);
-	printf("\t[-D] ................ allow duplicate prefixes (default: %d)\n", config.allow_dup_prefix);
-	printf("\t[-N] ................ no nx bit support (default: %d)\n", config.nx_support);
-	printf("\t[-s seed] ........... in random search, seed (default: time(0))\n");
-	printf("\t[-B brute_depth] .... in brute search, maximum search depth (default: %d)\n", config.brute_depth);
-	printf("\t[-P max_prefix] ..... maximum number of prefixes to search (default: %d)\n", config.max_prefix);
-	printf("\t[-i instruction] .... instruction at which to start search, inclusive (default: 0)\n");
-	printf("\t[-e instruction] .... instruction at which to end search, exclusive (default: ff..ff)\n");
-	printf("\t[-c core] ........... core on which to perform search (default: any)\n");
-	printf("\t[-X blacklist] ...... blacklist the specified instruction\n");
-	printf("\t[-j jobs] ........... number of simultaneous jobs to run (default: %d)\n", config.jobs);
-	printf("\t[-l range_bytes] .... number of base instruction bytes in each sub range (default: %d)\n", config.range_bytes);
-}
-
 void init_config(int argc, char** argv)
 {
-	int c, i, j;
+	int c, i;
 	opterr = 0;
 	bool seed_given = false;
 	while ((c = getopt(argc, argv, "?brtdRTx0Ns:DB:P:S:i:e:c:X:j:l:")) != -1) {
 		switch (c) {
-			case '?':
-				help();
-				exit(-1);
-				break;
-			case 'b':
-				mode = BRUTE;
-				break;
-			case 'r':
-				mode = RAND;
-				break;
-			case 't':
-				mode = TUNNEL;
-				break;
-			case 'd':
-				mode = DRIVEN;
-				break;
-			case 'R':
-				output = RAW;
-				break;
-			case 'T':
-				output = TEXT;
-				break;
-			case 'x':
-				config.show_tick = true;
-				break;
-			case '0':
-				config.enable_null_access = true;
-				break;
-			case 'N':
-				config.nx_support = false;
-				break;
-			case 's':
-				sscanf(optarg, "%ld", &config.seed);
-				seed_given = true;
-				break;
-			case 'P':
-				sscanf(optarg, "%d", &config.max_prefix);
-				break;
-			case 'B':
-				sscanf(optarg, "%d", &config.brute_depth);
-				break;
-			case 'D':
-				config.allow_dup_prefix = true;
-				break;
+			case 'b': mode = BRUTE; break;
+			case 'r': mode = RAND; break;
+			case 't': mode = TUNNEL; break;
+			case 'd': mode = DRIVEN; break;
+			case 'R': output = RAW; break;
+			case 'T': output = TEXT; break;
+			case 'x': config.show_tick = true; break;
+			case '0': config.enable_null_access = true; break;
+			case 'N': config.nx_support = false; break;
+			case 's': sscanf(optarg, "%ld", &config.seed); seed_given = true; break;
+			case 'P': sscanf(optarg, "%d", &config.max_prefix); break;
+			case 'B': sscanf(optarg, "%d", &config.brute_depth); break;
+			case 'D': config.allow_dup_prefix = true; break;
 			case 'i':
 				i = 0;
 				while (optarg[i * 2] && optarg[i * 2 + 1] && i < MAX_INSN_LENGTH) {
@@ -1342,10 +895,6 @@ void init_config(int argc, char** argv)
 					i++;
 				}
 				total_range.start.len = i;
-				while (i < MAX_INSN_LENGTH) {
-					total_range.start.bytes[i] = 0;
-					i++;
-				}
 				break;
 			case 'e':
 				i = 0;
@@ -1356,63 +905,21 @@ void init_config(int argc, char** argv)
 					i++;
 				}
 				total_range.end.len = i;
-				while (i < MAX_INSN_LENGTH) {
-					total_range.end.bytes[i] = 0;
-					i++;
-				}
 				break;
-			case 'c':
-				config.force_core = true;
-				sscanf(optarg, "%d", &config.core);
-				break;
-			case 'X':
-				j = 0;
-				while (opcode_blacklist[j].opcode) {
-					j++;
-				}
-				opcode_blacklist[j].opcode = (uint8_t*)malloc(strlen(optarg) / 2 + 1);
-				assert(opcode_blacklist[j].opcode);
-				i = 0;
-				while (optarg[i * 2] && optarg[i * 2 + 1]) {
-					unsigned int k;
-					sscanf(optarg + i * 2, "%02x", &k);
-					opcode_blacklist[j].opcode[i] = (uint8_t)k;
-					i++;
-				}
-				opcode_blacklist[j].len = i;
-				opcode_blacklist[j].reason = "user_blacklist";
-				opcode_blacklist[++j] = (ignore_op_t){NULL, 0, NULL};
-				break;
-			case 'j':
-				sscanf(optarg, "%d", &config.jobs);
-				break;
-			case 'l':
-				sscanf(optarg, "%d", &config.range_bytes);
-				break;
-			default:
-				usage();
-				exit(-1);
+			case 'c': config.force_core = true; sscanf(optarg, "%d", &config.core); break;
+			case 'j': sscanf(optarg, "%d", &config.jobs); break;
+			case 'l': sscanf(optarg, "%d", &config.range_bytes); break;
+			default: break;
 		}
 	}
-
-	if (optind != argc) {
-		usage();
-		exit(1);
-	}
-
-	if (!seed_given) {
-		config.seed = (long)time(0);
-	}
+	if (!seed_given) config.seed = (long)time(0);
 }
 
 void pin_core(void)
 {
 	if (config.force_core) {
 		DWORD_PTR mask = ((DWORD_PTR)1) << config.core;
-		if (!SetProcessAffinityMask(GetCurrentProcess(), mask)) {
-			printf("error: failed to set cpu\n");
-			exit(1);
-		}
+		SetProcessAffinityMask(GetCurrentProcess(), mask);
 	}
 }
 
@@ -1461,60 +968,38 @@ int main(int argc, char** argv)
 
 	init_config(argc, argv);
 	pin_core();
-
 	srand(config.seed);
 
-	packet_buffer = VirtualAlloc(NULL, PAGE_SIZE * 2, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-	assert(packet_buffer != NULL);
+	/* Allocate 64KB arena: Candidate instructions run in the middle with 32KB padding around */
+	arena_buffer = VirtualAlloc(NULL, ARENA_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	assert(arena_buffer != NULL);
+	memset(arena_buffer, 0x90, ARENA_SIZE); /* Fill with NOPs */
+
+	packet = ((char*)arena_buffer) + ARENA_OFFSET;
 
 #if USE_CAPSTONE
-	if (cs_open(CS_ARCH_X86, CS_MODE, &capstone_handle) != CS_ERR_OK) {
-		exit(1);
-	}
+	if (cs_open(CS_ARCH_X86, CS_MODE, &capstone_handle) != CS_ERR_OK) exit(1);
 	cs_option(capstone_handle, CS_OPT_DETAIL, CS_OPT_ON);
 	capstone_insn = cs_malloc(capstone_handle);
 #endif
 
 	AddVectoredExceptionHandler(1, veh_handler);
-
 	initialize_ranges();
 
 	while (move_next_range()) {
 		while (move_next_instruction()) {
 			pretext();
 
-			int expected_len = MAX_INSN_LENGTH;
-			int branch_len = 0;
-
-			if (is_branch_insn(inj.i.bytes, &branch_len)) {
-				expected_len = branch_len;
-			}
-			else {
+			expected_length = 1;
 #if USE_CAPSTONE
-				uint8_t* code = inj.i.bytes;
-				size_t code_size = MAX_INSN_LENGTH;
-				uint64_t address = (uintptr_t)packet_buffer;
-				if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-					expected_len = (int)(address - (uintptr_t)packet_buffer);
-				}
+			uint8_t* code = inj.i.bytes;
+			size_t code_size = MAX_INSN_LENGTH;
+			uint64_t address = (uintptr_t)packet;
+			if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
+				expected_length = (int)(address - (uintptr_t)packet);
+			}
 #endif
-			}
-
-			if (expected_len < 1) expected_len = 1;
-			if (expected_len > MAX_INSN_LENGTH) expected_len = MAX_INSN_LENGTH;
-
-			current_expected_len = expected_len;
-
-			inject(expected_len);
-
-			if (is_branch_insn(inj.i.bytes, NULL)) {
-				result.length = expected_len;
-			}
-
-			if (result.length < 1 || result.length > MAX_INSN_LENGTH) {
-				result.length = expected_len;
-			}
-
+			inject();
 			give_result(stdout);
 			tick();
 		}
@@ -1528,7 +1013,7 @@ int main(int argc, char** argv)
 	cs_close(&capstone_handle);
 #endif
 
-	VirtualFree(packet_buffer, 0, MEM_RELEASE);
+	VirtualFree(arena_buffer, 0, MEM_RELEASE);
 	free_ranges();
 	CloseHandle(pool_mutex);
 	CloseHandle(output_mutex);
