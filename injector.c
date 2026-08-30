@@ -532,6 +532,33 @@ bool is_prefix(uint8_t x)
 
 bool modifies_sp(const uint8_t* b)
 {
+#if USE_CAPSTONE
+	uint8_t* c_code = (uint8_t*)b;
+	size_t c_size = MAX_INSN_LENGTH;
+	uint64_t c_addr = 0x1000;
+	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &c_size, &c_addr, capstone_insn)) {
+		if (capstone_insn->detail) {
+			for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
+				uint16_t reg_w = capstone_insn->detail->regs_write[r];
+				if (reg_w == X86_REG_RSP || reg_w == X86_REG_ESP || reg_w == X86_REG_SP || reg_w == X86_REG_SPL) {
+					return true;
+				}
+			}
+			for (int op_i = 0; op_i < capstone_insn->detail->x86.op_count; op_i++) {
+				cs_x86_op* op_desc = &capstone_insn->detail->x86.operands[op_i];
+				if (op_desc->type == X86_OP_REG) {
+					if (op_desc->reg == X86_REG_RSP || op_desc->reg == X86_REG_ESP || 
+					    op_desc->reg == X86_REG_SP || op_desc->reg == X86_REG_SPL) {
+						if (op_desc->access & CS_AC_WRITE) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+#endif
+
 	int idx = 0;
 	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
 	if (idx >= MAX_INSN_LENGTH) return false;
@@ -546,48 +573,40 @@ bool modifies_sp(const uint8_t* b)
 		return true;
 	}
 
+	int modrm_idx = -1;
+
 	if (op == 0x0f) {
 		if (idx + 1 >= MAX_INSN_LENGTH) return false;
 		uint8_t op2 = b[idx + 1];
 		if (op2 == 0x05 || op2 == 0x07 || op2 == 0x34 || op2 == 0x35 || 
 		    op2 == 0xa0 || op2 == 0xa1 || op2 == 0xa8 || op2 == 0xa9) return true;
-		if (idx + 2 < MAX_INSN_LENGTH) {
-			uint8_t modrm = b[idx + 2];
-			uint8_t reg = (modrm >> 3) & 0x07;
-			uint8_t rm = modrm & 0x07;
-			uint8_t mod = modrm & 0xc0;
-			if (reg == 4) return true;
-			if (mod == 0xc0 && rm == 4) return true;
+		
+		if (op2 == 0x38 || op2 == 0x3a) {
+			modrm_idx = idx + 3;
+		} else {
+			modrm_idx = idx + 2;
 		}
-		return false;
+	} 
+	else if (op == 0xc5) {
+		modrm_idx = idx + 2;
+	} 
+	else if (op == 0xc4 || op == 0x8f || op == 0x62) {
+		modrm_idx = idx + 3;
+	} 
+	else {
+		modrm_idx = idx + 1;
 	}
 
-	if (idx + 1 < MAX_INSN_LENGTH) {
-		uint8_t modrm = b[idx + 1];
+	if (modrm_idx >= 0 && modrm_idx < MAX_INSN_LENGTH) {
+		uint8_t modrm = b[modrm_idx];
 		uint8_t reg = (modrm >> 3) & 0x07;
 		uint8_t rm = modrm & 0x07;
 		uint8_t mod = modrm & 0xc0;
 
-		if (reg == 4) {
-			uint8_t base_op = op & ~1;
-			if (base_op == 0x02 || base_op == 0x0a || base_op == 0x12 || base_op == 0x1a ||
-			    base_op == 0x22 || base_op == 0x2a || base_op == 0x32 || base_op == 0x3a ||
-			    base_op == 0x8a || op == 0x8d || op == 0x86 || op == 0x87) {
-				return true;
-			}
-		}
-
-		if (mod == 0xc0 && rm == 4) {
-			uint8_t base_op = op & ~1;
-			if (base_op == 0x00 || base_op == 0x08 || base_op == 0x10 || base_op == 0x18 ||
-			    base_op == 0x20 || base_op == 0x28 || base_op == 0x30 || base_op == 0x38 ||
-			    base_op == 0x80 || base_op == 0x88 || op == 0x8c || op == 0x8e ||
-			    base_op == 0xc0 || base_op == 0xc6 || (op >= 0xd0 && op <= 0xd3) ||
-			    base_op == 0xf6 || base_op == 0xfe || op == 0x86 || op == 0x87) {
-				return true;
-			}
-		}
+		if (reg == 4) return true;
+		if (mod == 0xc0 && rm == 4) return true;
 	}
+
 	return false;
 }
 
@@ -1319,6 +1338,7 @@ int main(int argc, char** argv)
 	if (cs_open(CS_ARCH_X86, CS_MODE, &capstone_handle) != CS_ERR_OK) {
 		exit(1);
 	}
+	cs_option(capstone_handle, CS_OPT_DETAIL, CS_OPT_ON);
 	capstone_insn = cs_malloc(capstone_handle);
 #endif
 
