@@ -123,8 +123,8 @@ typedef struct {
 state_t inject_state = {0};
 #endif
 
-void* packet_buffer;
-char* packet;
+void* packet_buffer = NULL;
+char* packet = NULL;
 
 static uint8_t dummy_stack_area[65536] __attribute__ ((aligned(4096)));
 
@@ -251,7 +251,7 @@ static int optind = 1;
 static int opterr = 1;
 static int optopt = '?';
 
-extern char debug, resume, preamble_start, preamble_end;
+extern char resume, preamble_start, preamble_end;
 static int expected_length;
 
 bool is_prefix(uint8_t x);
@@ -352,7 +352,7 @@ void sync_fflush(FILE* f, bool force)
 {
 	if (f == stdout) {
 		stdout_sync_counter++;
-		if (stdout_sync_counter == SYNC_LINES_STDOUT || force) {
+		if (stdout_sync_counter >= SYNC_LINES_STDOUT || force) {
 			stdout_sync_counter = 0;
 			WaitForSingleObject(output_mutex, INFINITE);
 			fwrite(stdout_buffer, stdout_buffer_pos - stdout_buffer, 1, f);
@@ -363,7 +363,7 @@ void sync_fflush(FILE* f, bool force)
 	}
 	else if (f == stderr) {
 		stderr_sync_counter++;
-		if (stderr_sync_counter == SYNC_LINES_STDERR || force) {
+		if (stderr_sync_counter >= SYNC_LINES_STDERR || force) {
 			stderr_sync_counter = 0;
 			WaitForSingleObject(output_mutex, INFINITE);
 			fwrite(stderr_buffer, stderr_buffer_pos - stderr_buffer, 1, f);
@@ -411,13 +411,6 @@ void print_insn(FILE* f, insn_t* insn)
 	for (i = 0; i < sizeof(insn->bytes); i++) {
 		sync_fprintf(f, "%02x", insn->bytes[i]);
 	}
-}
-
-void print_range(FILE* f, range_t* range)
-{
-	print_insn(f, &range->start);
-	sync_fprintf(f, ";");
-	print_insn(f, &range->end);
 }
 
 void initialize_ranges(void)
@@ -619,27 +612,23 @@ void preamble(void)
 {
 #if ARCH_X64
 	__asm__ __volatile__ (
-		".globl preamble_start\n"
-		"preamble_start:\n"
-		"pushfq\n"
-		"orq %0, (%%rsp)\n"
-		"popfq\n"
-		".globl preamble_end\n"
-		"preamble_end:\n"
-		:
-		: "i"(TF)
+		".globl preamble_start\n\t"
+		"preamble_start:\n\t"
+		"pushfq\n\t"
+		"orq $0x100, (%rsp)\n\t"
+		"popfq\n\t"
+		".globl preamble_end\n\t"
+		"preamble_end:\n\t"
 	);
 #else
 	__asm__ __volatile__ (
-		".globl preamble_start\n"
-		"preamble_start:\n"
-		"pushfl\n"
-		"orl %0, (%%esp)\n"
-		"popfl\n"
-		".globl preamble_end\n"
-		"preamble_end:\n"
-		:
-		: "i"(TF)
+		".globl preamble_start\n\t"
+		"preamble_start:\n\t"
+		"pushfl\n\t"
+		"orl $0x100, (%esp)\n\t"
+		"popfl\n\t"
+		".globl preamble_end\n\t"
+		"preamble_end:\n\t"
 	);
 #endif
 }
@@ -660,83 +649,48 @@ void inject(int insn_size)
 		((char*)packet)[i + preamble_length] = inj.i.bytes[i];
 	}
 
-	if (config.enable_null_access) {
-		void* p = NULL;
-		memset(p, 0, PAGE_SIZE);
-	}
-
 	if (!have_state) {
-		__asm__ __volatile__ ("ud2\n");
+		__asm__ __volatile__ ("ud2\n\t");
 		have_state = true;
 	}
 
 #if ARCH_X64
-	void* dummy_sp = (void*)(dummy_stack_area + 32768);
 	__asm__ __volatile__ (
-		"mov %[rax], %%rax \n"
-		"mov %[rbx], %%rbx \n"
-		"mov %[rcx], %%rcx \n"
-		"mov %[rdx], %%rdx \n"
-		"mov %[rsi], %%rsi \n"
-		"mov %[rdi], %%rdi \n"
-		"mov %[r8],  %%r8  \n"
-		"mov %[r9],  %%r9  \n"
-		"mov %[r10], %%r10 \n"
-		"mov %[r11], %%r11 \n"
-		"mov %[r12], %%r12 \n"
-		"mov %[r13], %%r13 \n"
-		"mov %[r14], %%r14 \n"
-		"mov %[r15], %%r15 \n"
-		"mov %[rbp], %%rbp \n"
-		"mov %[rsp], %%rsp \n"
-		"jmp *%[packet]    \n"
-		:
-		: [rax]"m"(inject_state.rax),
-		  [rbx]"m"(inject_state.rbx),
-		  [rcx]"m"(inject_state.rcx),
-		  [rdx]"m"(inject_state.rdx),
-		  [rsi]"m"(inject_state.rsi),
-		  [rdi]"m"(inject_state.rdi),
-		  [r8]"m"(inject_state.r8),
-		  [r9]"m"(inject_state.r9),
-		  [r10]"m"(inject_state.r10),
-		  [r11]"m"(inject_state.r11),
-		  [r12]"m"(inject_state.r12),
-		  [r13]"m"(inject_state.r13),
-		  [r14]"m"(inject_state.r14),
-		  [r15]"m"(inject_state.r15),
-		  [rbp]"m"(inject_state.rbp),
-		  [rsp]"r"(dummy_sp),
-		  [packet]"m"(packet)
+		"movq packet(%rip), %r11 \n\t"
+		"leaq dummy_stack_area+32768(%rip), %rsp \n\t"
+		"movq inject_state+0(%rip),  %rax \n\t"
+		"movq inject_state+8(%rip),  %rbx \n\t"
+		"movq inject_state+16(%rip), %rcx \n\t"
+		"movq inject_state+24(%rip), %rdx \n\t"
+		"movq inject_state+32(%rip), %rsi \n\t"
+		"movq inject_state+40(%rip), %rdi \n\t"
+		"movq inject_state+48(%rip), %r8  \n\t"
+		"movq inject_state+56(%rip), %r9  \n\t"
+		"movq inject_state+64(%rip), %r10 \n\t"
+		"movq inject_state+80(%rip), %r12 \n\t"
+		"movq inject_state+88(%rip), %r13 \n\t"
+		"movq inject_state+96(%rip), %r14 \n\t"
+		"movq inject_state+104(%rip), %r15 \n\t"
+		"movq inject_state+112(%rip), %rbp \n\t"
+		"jmp *%r11 \n\t"
 	);
 #else
-	void* dummy_sp = (void*)(dummy_stack_area + 32768);
 	__asm__ __volatile__ (
-		"mov %[eax], %%eax \n"
-		"mov %[ebx], %%ebx \n"
-		"mov %[ecx], %%ecx \n"
-		"mov %[edx], %%edx \n"
-		"mov %[esi], %%esi \n"
-		"mov %[edi], %%edi \n"
-		"mov %[ebp], %%ebp \n"
-		"mov %[esp], %%esp \n"
-		"jmp *%[packet]    \n"
-		:
-		: [eax]"m"(inject_state.eax),
-		  [ebx]"m"(inject_state.ebx),
-		  [ecx]"m"(inject_state.ecx),
-		  [edx]"m"(inject_state.edx),
-		  [esi]"m"(inject_state.esi),
-		  [edi]"m"(inject_state.edi),
-		  [ebp]"m"(inject_state.ebp),
-		  [esp]"r"(dummy_sp),
-		  [packet]"m"(packet)
+		"movl packet, %edx \n\t"
+		"leal dummy_stack_area+32768, %esp \n\t"
+		"movl inject_state+0,  %eax \n\t"
+		"movl inject_state+4,  %ebx \n\t"
+		"movl inject_state+8,  %ecx \n\t"
+		"movl inject_state+16, %esi \n\t"
+		"movl inject_state+20, %edi \n\t"
+		"movl inject_state+24, %ebp \n\t"
+		"jmp *%edx \n\t"
 	);
 #endif
 
 	__asm__ __volatile__ (
-		".globl resume \n"
-		"resume:       \n"
+		".globl resume \n\t"
+		"resume:       \n\t"
 	);
 }
 
