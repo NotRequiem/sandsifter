@@ -1,7 +1,10 @@
 ## s a n d s i f t e r 
-: the x86 processor fuzzer
+: the x86 processor fuzzer for Windows
+
 
 ### Overview
+
+<img width="400" height="211" alt="ezgif-4c0d6be99361545e" src="https://github.com/user-attachments/assets/87e14f8a-f691-4622-9097-abcf0241e178" />
 
 The sandsifter audits x86 processors for hidden instructions and hardware bugs,
 by systematically generating machine code to search through a processor's
@@ -16,14 +19,14 @@ enable users to check their own systems for hidden instructions and bugs.
 To run a basic audit against your processor:
 
 ```
-sudo ./sifter.py --unk --dis --len --sync --tick -- -P1 -t
+python sifter.py --unk --dis --len --sync --tick --save -- -t -P1
 ```
 
 ![demo_sandsifter](references/sandsifter.gif)
 
 The computer is systematically scanned for anomalous instructions.  In the upper
 half, you can view the instructions that the sandsifter is currently testing on
-the processor.  In the bottom half, the sandsifter reports anomalies it finds.
+the processor. In the bottom half, the sandsifter reports anomalies it finds.
 
 The search will take from a few hours to a few days, depending on the speed of
 and complexity of your processor.  When it is complete, summarize the results:
@@ -63,40 +66,14 @@ opening security vulnerabilities in the processor itself.
 Details of the results can be found in the project 
 [whitepaper](./references/domas_breaking_the_x86_isa_wp.pdf).
 
-(TODO: detailed results enumeration here)
-
-
 ### Building
 
 Sandsifter requires first installing the Capstone disassembler:
-http://www.capstone-engine.org/.  Capstone can typically be installed with:
-
-```
-sudo apt-get install libcapstone3 libcapstone-dev
-sudo pip install capstone
-```
-
-Sandsifter can be built with:
-
-```
-make
-```
-
-and is then run with 
-
-```
-sudo ./sifter.py --unk --dis --len --sync --tick -- -P1 -t
-```
+http://www.capstone-engine.org/.
 
 ### Flags
 
 Flags are passed to the sifter with --flag, and to the injector with -- -f.
-
-Example:
-
-```
-sudo ./sifter.py --unk --dis --len --sync --tick -- -P1 -t
-```
 
 Sifter flags:
 
@@ -223,29 +200,11 @@ command line, or cycled via hotkeys.
 
 
 ### Tips
-
-* sudo
-
-	For best results, the tool should be run as the root user.  This is necessary so
-	that the process can map into memory a page at address 0, which requires root
-	permissions.  This page prevents many instructions from seg-faulting on memory
-	accesses, which allows a more accurate fault analysis.
-
 * Prefixes
 
 	The primary limitation for the depth of an instruction search is the number
 	of prefix bytes to explore, with each additional prefix byte increasing the
 	search space by around a factor of 10.  Limit prefix bytes with the -P flag.
-
-* Colors
-
-	The interface for the sifter is designed for a 256 color terminal.  While
-	the details vary greatly depending on your terminal, this can roughly be
-	accomplished with:
-
-	```
-	export TERM='xterm-256color'
-	```
 
 * GUI
 
@@ -257,19 +216,8 @@ command line, or cycled via hotkeys.
 	graphical front end.  This can be done by running the injector directly:
 
 	```
-	sudo ./injector -P1 -t -0
+	injector.exe -t -T
 	```
-
-	To filter the results of a direct injector invocation, grep can be used.
-	For example,
-
-	```
-	sudo ./injector -P1 -r -0 | grep '\.r' | grep -v sigill
-	```
-
-	searches for instructions for which the processor and disassembler disagreed
-	on the instruction length (grep '\.r'), but the instruction successfully
-	executed (grep -v sigill).
 
 * Targeted fuzzing
 
@@ -279,7 +227,7 @@ command line, or cycled via hotkeys.
 	instruction space with the -i and -e flags:
 
 	```
-	sudo ./sifter.py --unk --dis --len --sync --tick -- -t -i f0f0 -e f0f1 -D -P15
+	python sifter.py --unk --dis --len --sync --tick -- -t -i f0f0 -e f0f1 -D -P15
 	```
 
 * Legacy systems
@@ -288,7 +236,7 @@ command line, or cycled via hotkeys.
 	pass the --low-mem flag to the sifter and the -N flag to the injector:
 
 	```
-	sudo ./sifter.py --unk --dis --len --sync --tick --low-mem -- -P1 -t -N
+	python sifter.py --unk --dis --len --sync --tick --low-mem -- -P1 -t -N
 	```
 
 	If you observe your scans completing too quickly (for example, a scan
