@@ -174,42 +174,66 @@ result_t result;
 disas_t disas;
 
 typedef struct {
-	char* opcode;
-	char* reason;
+	const uint8_t* opcode;
+	int len;
+	const char* reason;
 } ignore_op_t;
 
 ignore_op_t opcode_blacklist[MAX_BLACKLIST] = {
-	{ "\x0f\x34", "sysenter" },
-	{ "\x0f\xa1", "pop fs" },
-	{ "\x0f\xa9", "pop gs" },
-	{ "\x8e", "mov seg" },
-	{ "\xc8", "enter" },
+	{ (const uint8_t*)"\x0f\x34", 2, "sysenter" },
+	{ (const uint8_t*)"\x0f\xa1", 2, "pop fs" },
+	{ (const uint8_t*)"\x0f\xa9", 2, "pop gs" },
+	{ (const uint8_t*)"\x8e",     1, "mov seg" },
+	{ (const uint8_t*)"\xc8",     1, "enter" },
 #if !ARCH_X64
-	{ "\xc5", "lds" },
-	{ "\xc4", "les" },
+	{ (const uint8_t*)"\xc5",     1, "lds" },
+	{ (const uint8_t*)"\xc4",     1, "les" },
 #endif
-	{ "\x0f\xb2", "lss" },
-	{ "\x0f\xb4", "lfs" },
-	{ "\x0f\xb5", "lgs" },
+	{ (const uint8_t*)"\x0f\xb2", 2, "lss" },
+	{ (const uint8_t*)"\x0f\xb4", 2, "lfs" },
+	{ (const uint8_t*)"\x0f\xb5", 2, "lgs" },
 #if ARCH_X64
-	{ "\x63", "movsxd" }, 
+	{ (const uint8_t*)"\x63",     1, "movsxd" }, 
 #endif
-	{ "\xbc", "mov sp" },
-	{ "\xd1\xec", "shr sp, 1" },
-	{ "\xd1\xe4", "shl sp, 1" },
-	{ "\xd1\xfc", "sar sp, 1" },
-	{ "\xd1\xdc", "rcr sp, 1" },
-	{ "\xd1\xd4", "rcl sp, 1" },
-	{ "\xd1\xcc", "ror sp, 1" },
-	{ "\xd1\xc4", "rol sp, 1" },
-	{ "\x8d\xa2", "lea sp" },
-	{ "\xc7\xf8", "xbegin" },
-	{ "\xcd\x80", "int 0x80" },
-	{ "\x0f\x05", "syscall" },
-	{ "\x0f\xb9", "ud2" },
-	{ "\xc2", "ret 0x0000" },
-	{ NULL, NULL }
+	{ (const uint8_t*)"\xbc",     1, "mov sp" },
+	{ (const uint8_t*)"\xd1\xec", 2, "shr sp, 1" },
+	{ (const uint8_t*)"\xd1\xe4", 2, "shl sp, 1" },
+	{ (const uint8_t*)"\xd1\xfc", 2, "sar sp, 1" },
+	{ (const uint8_t*)"\xd1\xdc", 2, "rcr sp, 1" },
+	{ (const uint8_t*)"\xd1\xd4", 2, "rcl sp, 1" },
+	{ (const uint8_t*)"\xd1\xcc", 2, "ror sp, 1" },
+	{ (const uint8_t*)"\xd1\xc4", 2, "rol sp, 1" },
+	{ (const uint8_t*)"\x8d\xa2", 2, "lea sp" },
+	{ (const uint8_t*)"\xc7\xf8", 2, "xbegin" },
+	{ (const uint8_t*)"\xcd\x80", 2, "int 0x80" },
+	{ (const uint8_t*)"\x0f\x05", 2, "syscall" },
+	{ (const uint8_t*)"\x0f\xb9", 2, "ud2" },
+	{ (const uint8_t*)"\xc2",     1, "ret 0x0000" },
+
+	{ (const uint8_t*)"\x0f\x00", 2, "sldt/str/lldt/ltr" },
+	{ (const uint8_t*)"\x0f\x01", 2, "sgdt/sidt/lgdt/lidt/smsw/lmsw" },
+
+	{ NULL, 0, NULL }
 };
+
+bool has_opcode(const uint8_t* op, int op_len)
+{
+	int i, j;
+	for (i = 0; i < MAX_INSN_LENGTH; i++) {
+		if (!is_prefix(inj.i.bytes[i])) {
+			if (i + op_len > MAX_INSN_LENGTH) {
+				return false;
+			}
+			for (j = 0; j < op_len; j++) {
+				if (inj.i.bytes[i + j] != op[j]) {
+					return false;
+				}
+			}
+			return true;
+		}
+	}
+	return false;
+}
 
 typedef struct {
 	char* prefix;
@@ -915,7 +939,7 @@ bool move_next_instruction(void)
 
 	i = 0;
 	while (opcode_blacklist[i].opcode) {
-		if (has_opcode((uint8_t*)opcode_blacklist[i].opcode)) {
+		if (has_opcode(opcode_blacklist[i].opcode, opcode_blacklist[i].len)) {
 			switch (output) {
 				case TEXT:
 					sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
@@ -933,7 +957,7 @@ bool move_next_instruction(void)
 		}
 		i++;
 	}
-
+	
 	i = 0;
 	while (prefix_blacklist[i].prefix) {
 		if (has_prefix((uint8_t*)prefix_blacklist[i].prefix)) {
