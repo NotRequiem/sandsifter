@@ -126,6 +126,7 @@ state_t inject_state = {0};
 void* packet_buffer = NULL;
 char* packet = NULL;
 static int current_insn_size = 0;
+static int current_expected_len = 0;
 
 static uint8_t dummy_stack_area[65536] __attribute__ ((aligned(4096)));
 
@@ -273,6 +274,7 @@ bool has_prefix(uint8_t* pre);
 bool modifies_sp(const uint8_t* b);
 bool is_backward_branch(const uint8_t* b);
 bool is_rip_relative_write(const uint8_t* b);
+bool is_branch_insn(const uint8_t* b, int* branch_len);
 void print_mc(FILE* f, int length);
 void give_result(FILE* f);
 int prefix_count(void);
@@ -530,6 +532,35 @@ bool is_prefix(uint8_t x)
 		|| (x >= 0x40 && x <= 0x4f)
 #endif
 		;
+}
+
+bool is_branch_insn(const uint8_t* b, int* branch_len)
+{
+	int idx = 0;
+	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
+	if (idx >= MAX_INSN_LENGTH) return false;
+
+	uint8_t op = b[idx];
+
+	if ((op >= 0x70 && op <= 0x7f) || op == 0xeb || (op >= 0xe0 && op <= 0xe3)) {
+		if (branch_len) *branch_len = idx + 2;
+		return true;
+	}
+
+	if (op == 0x0f && idx + 1 < MAX_INSN_LENGTH) {
+		uint8_t op2 = b[idx + 1];
+		if (op2 >= 0x80 && op2 <= 0x8f) {
+			if (branch_len) *branch_len = idx + 6;
+			return true;
+		}
+	}
+
+	if (op == 0xe9 || op == 0xe8) {
+		if (branch_len) *branch_len = idx + 5;
+		return true;
+	}
+
+	return false;
 }
 
 bool is_backward_branch(const uint8_t* b)
@@ -792,20 +823,12 @@ void inject(int insn_size)
 	int i;
 	current_insn_size = insn_size;
 
-	for (i = 0; i < 1024; i += 2) {
-		((uint8_t*)packet_buffer)[i] = 0x0f;
-		((uint8_t*)packet_buffer)[i + 1] = 0x0b;
-	}
+	memset(packet_buffer, 0xCC, PAGE_SIZE * 2);
 
-	packet = (char*)packet_buffer + 256;
+	packet = (char*)packet_buffer;
 
 	for (i = 0; i < insn_size && i < MAX_INSN_LENGTH; i++) {
 		((char*)packet)[i] = inj.i.bytes[i];
-	}
-
-	for (i = insn_size; i < insn_size + 32; i += 2) {
-		((char*)packet)[i] = 0x0f;
-		((char*)packet)[i + 1] = 0x0b;
 	}
 
 	if (!have_state) {
@@ -875,7 +898,7 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 
 	int insn_length = (int)(fault_ip - (uintptr_t)packet);
 	if (insn_length < 0 || insn_length > MAX_INSN_LENGTH) {
-		insn_length = JMP_LENGTH;
+		insn_length = current_expected_len;
 	}
 
 	DWORD code = pExceptionInfo->ExceptionRecord->ExceptionCode;
@@ -884,16 +907,16 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	uint32_t addr = (uint32_t)-1;
 
 	switch (code) {
+		case EXCEPTION_BREAKPOINT:
+		case EXCEPTION_SINGLE_STEP:
+			signum = SIGTRAP;
+			si_code = 1;
+			insn_length = current_expected_len;
+			break;
 		case EXCEPTION_ILLEGAL_INSTRUCTION:
 		case EXCEPTION_PRIV_INSTRUCTION:
-			if (fault_ip >= (uintptr_t)packet + current_insn_size) {
-				signum = SIGTRAP;
-				si_code = 1;
-				insn_length = current_insn_size;
-			} else {
-				signum = SIGILL;
-				si_code = 1;
-			}
+			signum = SIGILL;
+			si_code = 1;
 			break;
 		case EXCEPTION_ACCESS_VIOLATION:
 		case EXCEPTION_IN_PAGE_ERROR:
@@ -1478,18 +1501,32 @@ int main(int argc, char** argv)
 			pretext();
 
 			int expected_len = MAX_INSN_LENGTH;
-#if USE_CAPSTONE
-			uint8_t* code = inj.i.bytes;
-			size_t code_size = MAX_INSN_LENGTH;
-			uint64_t address = (uintptr_t)packet_buffer;
-			if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-				expected_len = (int)(address - (uintptr_t)packet_buffer);
+			int branch_len = 0;
+
+			if (is_branch_insn(inj.i.bytes, &branch_len)) {
+				expected_len = branch_len;
 			}
+			else {
+#if USE_CAPSTONE
+				uint8_t* code = inj.i.bytes;
+				size_t code_size = MAX_INSN_LENGTH;
+				uint64_t address = (uintptr_t)packet_buffer;
+				if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
+					expected_len = (int)(address - (uintptr_t)packet_buffer);
+				}
 #endif
+			}
+
 			if (expected_len < 1) expected_len = 1;
 			if (expected_len > MAX_INSN_LENGTH) expected_len = MAX_INSN_LENGTH;
 
+			current_expected_len = expected_len;
+
 			inject(expected_len);
+
+			if (is_branch_insn(inj.i.bytes, NULL)) {
+				result.length = expected_len;
+			}
 
 			if (result.length < 1 || result.length > MAX_INSN_LENGTH) {
 				result.length = expected_len;
