@@ -1038,190 +1038,143 @@ void init_inj(const insn_t* new_insn)
 
 bool move_next_instruction(void)
 {
-	int i;
+	while (1) {
+		int i;
 
-	switch (mode) {
-		case RAND:
-			if (!search_range.started) {
-				init_inj(&null_insn);
-				get_rand_insn_in_range(&search_range);
-			}
-			else {
-				get_rand_insn_in_range(&search_range);
-			}
-			break;
-		case BRUTE:
-			if (!search_range.started) {
-				init_inj(&search_range.start);
-				inj.index = config.brute_depth - 1;
-			}
-			else {
-				for (inj.index = config.brute_depth - 1; inj.index >= 0; inj.index--) {
-					inj.i.bytes[inj.index]++;
-					if (inj.i.bytes[inj.index]) {
-						break;
-					}
+		switch (mode) {
+			case RAND:
+				if (!search_range.started) {
+					init_inj(&null_insn);
+					get_rand_insn_in_range(&search_range);
 				}
-			}
-			break;
-		case TUNNEL:
-			if (!search_range.started) {
-				init_inj(&search_range.start);
-				inj.index = search_range.start.len;
-			}
-			else {
-				if (result.length != inj.last_len && inj.index < result.length - 1) {
-					inj.index++;
+				else {
+					get_rand_insn_in_range(&search_range);
 				}
-				inj.last_len = result.length;
-
-				inj.i.bytes[inj.index]++;
-
-				while (inj.index >= 0 && inj.i.bytes[inj.index] == 0) {
-					inj.index--;
-					if (inj.index >= 0) {
+				break;
+			case BRUTE:
+				if (!search_range.started) {
+					init_inj(&search_range.start);
+					inj.index = config.brute_depth - 1;
+				}
+				else {
+					for (inj.index = config.brute_depth - 1; inj.index >= 0; inj.index--) {
 						inj.i.bytes[inj.index]++;
+						if (inj.i.bytes[inj.index]) {
+							break;
+						}
 					}
-					inj.last_len = -1;
 				}
+				break;
+			case TUNNEL:
+				if (!search_range.started) {
+					init_inj(&search_range.start);
+					inj.index = search_range.start.len;
+				}
+				else {
+					if (result.length != inj.last_len && inj.index < result.length - 1) {
+						inj.index++;
+					}
+					inj.last_len = result.length;
+
+					inj.i.bytes[inj.index]++;
+
+					while (inj.index >= 0 && inj.i.bytes[inj.index] == 0) {
+						inj.index--;
+						if (inj.index >= 0) {
+							inj.i.bytes[inj.index]++;
+						}
+						inj.last_len = -1;
+					}
+				}
+				break;
+			case DRIVEN:
+				i = MAX_INSN_LENGTH;
+				do {
+					i -= (int)fread(inj.i.bytes, 1, i, stdin);
+				} while (i > 0);
+				break;
+			default:
+				assert(0);
+		}
+		search_range.started = true;
+
+		if (is_backward_branch(inj.i.bytes)) {
+			if (output == RAW) {
+				result = (result_t){0,0,0,0,0};
+				give_result(stdout);
 			}
-			break;
-		case DRIVEN:
-			i = MAX_INSN_LENGTH;
-			do {
-				i -= (int)fread(inj.i.bytes, 1, i, stdin);
-			} while (i > 0);
-			break;
-		default:
-			assert(0);
-	}
-	search_range.started = true;
+			continue;
+		}
 
-	if (is_backward_branch(inj.i.bytes)) {
-		switch (output) {
-			case TEXT:
-				sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
-				sync_fprintf(stdout, "... (backward_branch)\n");
-				sync_fflush(stdout, false);
-				break;
-			case RAW:
+		if (is_rip_relative_write(inj.i.bytes)) {
+			if (output == RAW) {
 				result = (result_t){0,0,0,0,0};
 				give_result(stdout);
-				break;
-			default:
-				assert(0);
+			}
+			continue;
 		}
-		return move_next_instruction();
-	}
 
-	if (is_rip_relative_write(inj.i.bytes)) {
-		switch (output) {
-			case TEXT:
-				sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
-				sync_fprintf(stdout, "... (rip_rel_write)\n");
-				sync_fflush(stdout, false);
-				break;
-			case RAW:
+		if (modifies_sp(inj.i.bytes)) {
+			if (output == RAW) {
 				result = (result_t){0,0,0,0,0};
 				give_result(stdout);
-				break;
-			default:
-				assert(0);
+			}
+			continue;
 		}
-		return move_next_instruction();
-	}
 
-	if (modifies_sp(inj.i.bytes)) {
-		switch (output) {
-			case TEXT:
-				sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
-				sync_fprintf(stdout, "... (modifies_sp)\n");
-				sync_fflush(stdout, false);
-				break;
-			case RAW:
-				result = (result_t){0,0,0,0,0};
-				give_result(stdout);
-				break;
-			default:
-				assert(0);
-		}
-		return move_next_instruction();
-	}
-
-	i = 0;
-	while (opcode_blacklist[i].opcode) {
-		if (has_opcode(opcode_blacklist[i].opcode, opcode_blacklist[i].len)) {
-			switch (output) {
-				case TEXT:
-					sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
-					sync_fprintf(stdout, "... (%s)\n", opcode_blacklist[i].reason);
-					sync_fflush(stdout, false);
-					break;
-				case RAW:
+		bool blacklisted = false;
+		i = 0;
+		while (opcode_blacklist[i].opcode) {
+			if (has_opcode(opcode_blacklist[i].opcode, opcode_blacklist[i].len)) {
+				if (output == RAW) {
 					result = (result_t){0,0,0,0,0};
 					give_result(stdout);
-					break;
-				default:
-					assert(0);
+				}
+				blacklisted = true;
+				break;
 			}
-			return move_next_instruction();
+			i++;
 		}
-		i++;
-	}
+		if (blacklisted) continue;
 
-	i = 0;
-	while (prefix_blacklist[i].prefix) {
-		if (has_prefix((uint8_t*)prefix_blacklist[i].prefix)) {
-			switch (output) {
-				case TEXT:
-					sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
-					sync_fprintf(stdout, "... (%s)\n", prefix_blacklist[i].reason);
-					sync_fflush(stdout, false);
-					break;
-				case RAW:
+		i = 0;
+		while (prefix_blacklist[i].prefix) {
+			if (has_prefix((uint8_t*)prefix_blacklist[i].prefix)) {
+				if (output == RAW) {
 					result = (result_t){0,0,0,0,0};
 					give_result(stdout);
-					break;
-				default:
-					assert(0);
-			}
-			return move_next_instruction();
-		}
-		i++;
-	}
-
-	if (prefix_count() > config.max_prefix || (!config.allow_dup_prefix && has_dup_prefix())) {
-		switch (output) {
-			case TEXT:
-				sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
-				sync_fprintf(stdout, "... (%s)\n", "prefix violation");
-				sync_fflush(stdout, false);
+				}
+				blacklisted = true;
 				break;
-			case RAW:
+			}
+			i++;
+		}
+		if (blacklisted) continue;
+
+		if (prefix_count() > config.max_prefix || (!config.allow_dup_prefix && has_dup_prefix())) {
+			if (output == RAW) {
 				result = (result_t){0,0,0,0,0};
 				give_result(stdout);
-				break;
+			}
+			continue;
+		}
+
+		if (memcmp(inj.i.bytes, search_range.end.bytes, sizeof(inj.i.bytes)) >= 0) {
+			return false;
+		}
+
+		switch (mode) {
+			case RAND:
+				return true;
+			case BRUTE:
+				return inj.index >= 0;
+			case TUNNEL:
+				return inj.index >= 0;
+			case DRIVEN:
+				return true;
 			default:
 				assert(0);
 		}
-		return move_next_instruction();
-	}
-
-	if (memcmp(inj.i.bytes, search_range.end.bytes, sizeof(inj.i.bytes)) >= 0) {
-		return false;
-	}
-
-	switch (mode) {
-		case RAND:
-			return true;
-		case BRUTE:
-			return inj.index >= 0;
-		case TUNNEL:
-			return inj.index >= 0;
-		case DRIVEN:
-			return true;
-		default:
-			assert(0);
 	}
 }
 
