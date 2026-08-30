@@ -272,6 +272,7 @@ bool has_opcode(const uint8_t* op, int op_len);
 bool has_prefix(uint8_t* pre);
 bool modifies_sp(const uint8_t* b);
 bool is_backward_branch(const uint8_t* b);
+bool is_rip_relative_write(const uint8_t* b);
 void print_mc(FILE* f, int length);
 void give_result(FILE* f);
 int prefix_count(void);
@@ -572,6 +573,49 @@ bool is_backward_branch(const uint8_t* b)
 	return false;
 }
 
+bool is_rip_relative_write(const uint8_t* b)
+{
+#if ARCH_X64
+	int idx = 0;
+	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
+	if (idx >= MAX_INSN_LENGTH) return false;
+	
+	uint8_t op = b[idx];
+	int modrm_idx = -1;
+
+	if (op == 0x0f) {
+		if (idx + 1 >= MAX_INSN_LENGTH) return false;
+		uint8_t op2 = b[idx + 1];
+		if (op2 == 0x38 || op2 == 0x3a) {
+			modrm_idx = idx + 3;
+		} else {
+			modrm_idx = idx + 2;
+		}
+	} else if (op == 0xc5) {
+		modrm_idx = idx + 2;
+	} else if (op == 0xc4 || op == 0x8f || op == 0x62) {
+		modrm_idx = idx + 3;
+	} else {
+		modrm_idx = idx + 1;
+	}
+
+	if (modrm_idx >= 0 && modrm_idx < MAX_INSN_LENGTH) {
+		uint8_t modrm = b[modrm_idx];
+		if ((modrm & 0xc7) == 0x05) {
+			uint8_t base_op = op & ~1;
+			if (base_op == 0x00 || base_op == 0x08 || base_op == 0x10 || base_op == 0x18 ||
+			    base_op == 0x20 || base_op == 0x28 || base_op == 0x30 || base_op == 0x38 ||
+			    base_op == 0x88 || base_op == 0xc0 || base_op == 0xc6 ||
+			    (op >= 0xd0 && op <= 0xd3) || base_op == 0xf6 || base_op == 0xfe ||
+			    op == 0x86 || op == 0x87) {
+				return true;
+			}
+		}
+	}
+#endif
+	return false;
+}
+
 bool modifies_sp(const uint8_t* b)
 {
 #if USE_CAPSTONE
@@ -748,19 +792,21 @@ void inject(int insn_size)
 	int i;
 	current_insn_size = insn_size;
 
-	for (i = 0; i < 512; i += 2) {
+	for (i = 0; i < 1024; i += 2) {
 		((uint8_t*)packet_buffer)[i] = 0x0f;
 		((uint8_t*)packet_buffer)[i + 1] = 0x0b;
 	}
 
-	packet = (char*)packet_buffer + 128;
+	packet = (char*)packet_buffer + 256;
 
 	for (i = 0; i < insn_size && i < MAX_INSN_LENGTH; i++) {
 		((char*)packet)[i] = inj.i.bytes[i];
 	}
 
-	((char*)packet)[insn_size] = 0x0f;
-	((char*)packet)[insn_size + 1] = 0x0b;
+	for (i = insn_size; i < insn_size + 32; i += 2) {
+		((char*)packet)[i] = 0x0f;
+		((char*)packet)[i + 1] = 0x0b;
+	}
 
 	if (!have_state) {
 		__asm__ __volatile__ ("ud2\n\t");
@@ -840,7 +886,7 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	switch (code) {
 		case EXCEPTION_ILLEGAL_INSTRUCTION:
 		case EXCEPTION_PRIV_INSTRUCTION:
-			if (fault_ip == (uintptr_t)packet + current_insn_size) {
+			if (fault_ip >= (uintptr_t)packet + current_insn_size) {
 				signum = SIGTRAP;
 				si_code = 1;
 				insn_length = current_insn_size;
@@ -1003,6 +1049,23 @@ bool move_next_instruction(void)
 			case TEXT:
 				sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
 				sync_fprintf(stdout, "... (backward_branch)\n");
+				sync_fflush(stdout, false);
+				break;
+			case RAW:
+				result = (result_t){0,0,0,0,0};
+				give_result(stdout);
+				break;
+			default:
+				assert(0);
+		}
+		return move_next_instruction();
+	}
+
+	if (is_rip_relative_write(inj.i.bytes)) {
+		switch (output) {
+			case TEXT:
+				sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
+				sync_fprintf(stdout, "... (rip_rel_write)\n");
 				sync_fflush(stdout, false);
 				break;
 			case RAW:
