@@ -271,6 +271,7 @@ bool is_prefix(uint8_t x);
 bool has_opcode(const uint8_t* op, int op_len);
 bool has_prefix(uint8_t* pre);
 bool modifies_sp(const uint8_t* b);
+bool is_backward_branch(const uint8_t* b);
 void print_mc(FILE* f, int length);
 void give_result(FILE* f);
 int prefix_count(void);
@@ -530,6 +531,47 @@ bool is_prefix(uint8_t x)
 		;
 }
 
+bool is_backward_branch(const uint8_t* b)
+{
+	int idx = 0;
+	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
+	if (idx >= MAX_INSN_LENGTH) return false;
+
+	uint8_t op = b[idx];
+
+	if ((op >= 0x70 && op <= 0x7f) || op == 0xeb || (op >= 0xe0 && op <= 0xe3)) {
+		if (idx + 1 < MAX_INSN_LENGTH) {
+			int8_t disp8 = (int8_t)b[idx + 1];
+			if (disp8 <= 0) {
+				return true;
+			}
+		}
+	}
+
+	if (op == 0x0f && idx + 1 < MAX_INSN_LENGTH) {
+		uint8_t op2 = b[idx + 1];
+		if (op2 >= 0x80 && op2 <= 0x8f) {
+			if (idx + 5 < MAX_INSN_LENGTH) {
+				int32_t disp32 = (int32_t)(b[idx + 2] | (b[idx + 3] << 8) | 
+				                          (b[idx + 4] << 16) | (b[idx + 5] << 24));
+				if (disp32 <= 0) {
+					return true;
+				}
+			}
+		}
+	}
+
+	if (op == 0xe9 && idx + 4 < MAX_INSN_LENGTH) {
+		int32_t disp32 = (int32_t)(b[idx + 1] | (b[idx + 2] << 8) | 
+		                          (b[idx + 3] << 16) | (b[idx + 4] << 24));
+		if (disp32 <= 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 bool modifies_sp(const uint8_t* b)
 {
 #if USE_CAPSTONE
@@ -706,7 +748,12 @@ void inject(int insn_size)
 	int i;
 	current_insn_size = insn_size;
 
-	packet = (char*)packet_buffer;
+	for (i = 0; i < 512; i += 2) {
+		((uint8_t*)packet_buffer)[i] = 0x0f;
+		((uint8_t*)packet_buffer)[i + 1] = 0x0b;
+	}
+
+	packet = (char*)packet_buffer + 128;
 
 	for (i = 0; i < insn_size && i < MAX_INSN_LENGTH; i++) {
 		((char*)packet)[i] = inj.i.bytes[i];
@@ -950,6 +997,23 @@ bool move_next_instruction(void)
 			assert(0);
 	}
 	search_range.started = true;
+
+	if (is_backward_branch(inj.i.bytes)) {
+		switch (output) {
+			case TEXT:
+				sync_fprintf(stdout, "x: "); print_mc(stdout, 16);
+				sync_fprintf(stdout, "... (backward_branch)\n");
+				sync_fflush(stdout, false);
+				break;
+			case RAW:
+				result = (result_t){0,0,0,0,0};
+				give_result(stdout);
+				break;
+			default:
+				assert(0);
+		}
+		return move_next_instruction();
+	}
 
 	if (modifies_sp(inj.i.bytes)) {
 		switch (output) {
