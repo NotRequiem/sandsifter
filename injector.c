@@ -8,6 +8,8 @@
 #include <string.h>
 #include <time.h>
 #include <assert.h>
+#include <fcntl.h>
+#include <io.h>
 
 #if defined(__x86_64__) || defined(_M_X64)
 	#define ARCH_X64 1
@@ -124,10 +126,7 @@ state_t inject_state = {0};
 void* packet_buffer;
 char* packet;
 
-struct {
-	uint64_t dummy_stack_hi[256];
-	uint64_t dummy_stack_lo[256];
-} dummy_stack __attribute__ ((aligned(PAGE_SIZE)));
+static uint8_t dummy_stack_area[65536] __attribute__ ((aligned(4096)));
 
 typedef struct {
 	uint8_t bytes[MAX_INSN_LENGTH];
@@ -666,15 +665,13 @@ void inject(int insn_size)
 		memset(p, 0, PAGE_SIZE);
 	}
 
-	dummy_stack.dummy_stack_lo[0] = 0;
-
 	if (!have_state) {
 		__asm__ __volatile__ ("ud2\n");
 		have_state = true;
 	}
 
 #if ARCH_X64
-	void* dummy_sp = (void*)&dummy_stack.dummy_stack_lo;
+	void* dummy_sp = (void*)(dummy_stack_area + 32768);
 	__asm__ __volatile__ (
 		"mov %[rax], %%rax \n"
 		"mov %[rbx], %%rbx \n"
@@ -713,7 +710,7 @@ void inject(int insn_size)
 		  [packet]"m"(packet)
 	);
 #else
-	void* dummy_sp = (void*)&dummy_stack.dummy_stack_lo;
+	void* dummy_sp = (void*)(dummy_stack_area + 32768);
 	__asm__ __volatile__ (
 		"mov %[eax], %%eax \n"
 		"mov %[ebx], %%ebx \n"
@@ -1286,6 +1283,9 @@ int main(int argc, char** argv)
 	DWORD old_prot;
 
 	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+
+	_setmode(_fileno(stdout), _O_BINARY);
+	_setmode(_fileno(stderr), _O_BINARY);
 
 	pool_mutex = CreateMutexA(NULL, FALSE, NULL);
 	output_mutex = CreateMutexA(NULL, FALSE, NULL);
