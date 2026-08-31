@@ -137,38 +137,39 @@ typedef struct {
 } ignore_op_t;
 
 ignore_op_t opcode_blacklist[MAX_BLACKLIST] = {
-	{ (uint8_t*)"\x0f\x34", 2, "sysenter" },
-	{ (uint8_t*)"\x0f\x35", 2, "sysexit" },
-	{ (uint8_t*)"\x0f\x05", 2, "syscall" },
-	{ (uint8_t*)"\x0f\x07", 2, "sysret" },
-	{ (uint8_t*)"\x0f\xa1", 2, "pop fs" },
-	{ (uint8_t*)"\x0f\xa9", 2, "pop gs" },
-	{ (uint8_t*)"\x0f\xa0", 2, "push fs" },
-	{ (uint8_t*)"\x0f\xa8", 2, "push gs" },
-	{ (uint8_t*)"\x0f\x01", 2, "system/swapgs/mwait/monitor" },
-	{ (uint8_t*)"\x0f\x00", 2, "sldt/str/lldt/ltr" },
-	{ (uint8_t*)"\x0f\xae", 2, "xsave/xrstor/fsgsbase" },
+	{ (uint8_t*)"\x0f\x34",     2, "sysenter" },
+	{ (uint8_t*)"\x0f\x35",     2, "sysexit" },
+	{ (uint8_t*)"\x0f\x05",     2, "syscall" },
+	{ (uint8_t*)"\x0f\x07",     2, "sysret" },
+	{ (uint8_t*)"\x0f\xa1",     2, "pop fs" },
+	{ (uint8_t*)"\x0f\xa9",     2, "pop gs" },
+	{ (uint8_t*)"\x0f\xa0",     2, "push fs" },
+	{ (uint8_t*)"\x0f\xa8",     2, "push gs" },
+	{ (uint8_t*)"\x0f\x01\xc8", 3, "monitor" },
+	{ (uint8_t*)"\x0f\x01\xc9", 3, "mwait" },
+	{ (uint8_t*)"\x0f\x01\xf8", 3, "swapgs" },
+	{ (uint8_t*)"\x0f\xae",     2, "xsave/xrstor/fsgsbase" },
 	{ (uint8_t*)"\x0f\xc7\xec", 3, "wrpkru" },
 	{ (uint8_t*)"\x0f\xc7\xed", 3, "wrpkru" },
 	{ (uint8_t*)"\x0f\xc7\xee", 3, "wrpkru" },
 	{ (uint8_t*)"\x0f\xc7\xef", 3, "wrpkru" },
-	{ (uint8_t*)"\x0f\xaa", 2, "rsm" },
-	{ (uint8_t*)"\x0f\xb2", 2, "lss" },
-	{ (uint8_t*)"\x0f\xb4", 2, "lfs" },
-	{ (uint8_t*)"\x0f\xb5", 2, "lgs" },
-	{ (uint8_t*)"\x8e",     1, "mov seg" },
-	{ (uint8_t*)"\xcd",     1, "int imm8 / fastfail" },
-	{ (uint8_t*)"\xcc",     1, "int3" },
-	{ (uint8_t*)"\xce",     1, "into" },
-	{ (uint8_t*)"\xf1",     1, "icebp" },
-	{ (uint8_t*)"\xc8",     1, "enter" },
-	{ (uint8_t*)"\xc7\xf8", 2, "xbegin" },
-	{ (uint8_t*)"\x0f\xb9", 2, "ud2" },
-	{ (uint8_t*)"\xc2",     1, "ret imm16" },
-	{ (uint8_t*)"\xc3",     1, "ret" },
-	{ (uint8_t*)"\xca",     1, "retf imm16" },
-	{ (uint8_t*)"\xcb",     1, "retf" },
-	{ (uint8_t*)"\xcf",     1, "iret" },
+	{ (uint8_t*)"\x0f\xaa",     2, "rsm" },
+	{ (uint8_t*)"\x0f\xb2",     2, "lss" },
+	{ (uint8_t*)"\x0f\xb4",     2, "lfs" },
+	{ (uint8_t*)"\x0f\xb5",     2, "lgs" },
+	{ (uint8_t*)"\x8e",         1, "mov seg" },
+	{ (uint8_t*)"\xcd\x29",     2, "fastfail" },
+	{ (uint8_t*)"\xcc",         1, "int3" },
+	{ (uint8_t*)"\xce",         1, "into" },
+	{ (uint8_t*)"\xf1",         1, "icebp" },
+	{ (uint8_t*)"\xc8",         1, "enter" },
+	{ (uint8_t*)"\xc7\xf8",     2, "xbegin" },
+	{ (uint8_t*)"\x0f\xb9",     2, "ud2" },
+	{ (uint8_t*)"\xc2",         1, "ret imm16" },
+	{ (uint8_t*)"\xc3",         1, "ret" },
+	{ (uint8_t*)"\xca",         1, "retf imm16" },
+	{ (uint8_t*)"\xcb",         1, "retf" },
+	{ (uint8_t*)"\xcf",         1, "iret" },
 	{ NULL, 0, NULL }
 };
 
@@ -178,6 +179,8 @@ typedef struct {
 } ignore_pre_t;
 
 ignore_pre_t prefix_blacklist[] = {
+	{ "\x65", "gs" },
+	{ "\x64", "fs" },
 	{ NULL, NULL }
 };
 
@@ -206,13 +209,14 @@ bool is_prefix(uint8_t x);
 bool has_opcode(const uint8_t* op, int op_len);
 bool is_backward_branch(const uint8_t* b);
 bool is_indirect_branch(const uint8_t* b);
+bool is_rip_relative_self_modify(const uint8_t* b);
 bool is_branch_insn(const uint8_t* b, int* branch_len);
 bool modifies_sp(const uint8_t* b);
 void print_mc(FILE* f, int length);
 void give_result(FILE* f);
 int prefix_count(void);
 bool has_dup_prefix(void);
-void inject(void);
+void inject(int len);
 bool move_next_instruction(void);
 bool move_next_range(void);
 void init_config(int argc, char** argv);
@@ -499,7 +503,6 @@ bool is_indirect_branch(const uint8_t* b)
 
 	uint8_t op = b[idx];
 
-	// Opcode 0xFF with ModR/M reg = 2, 3, 4, 5 (CALL r/m, CALL m_far, JMP r/m, JMP m_far)
 	if (op == 0xff && idx + 1 < MAX_INSN_LENGTH) {
 		uint8_t modrm = b[idx + 1];
 		uint8_t reg = (modrm >> 3) & 0x07;
@@ -508,7 +511,6 @@ bool is_indirect_branch(const uint8_t* b)
 		}
 	}
 
-	// Far direct jump/call imm
 	if (op == 0xea || op == 0x9a) {
 		return true;
 	}
@@ -516,13 +518,54 @@ bool is_indirect_branch(const uint8_t* b)
 	return false;
 }
 
+bool is_rip_relative_self_modify(const uint8_t* b)
+{
+#if ARCH_X64
+	int idx = 0;
+	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
+	if (idx >= MAX_INSN_LENGTH) return false;
+
+	uint8_t op = b[idx];
+	int modrm_idx = -1;
+
+	if (op == 0x0f) {
+		if (idx + 1 >= MAX_INSN_LENGTH) return false;
+		uint8_t op2 = b[idx + 1];
+		if (op2 == 0x38 || op2 == 0x3a) modrm_idx = idx + 3;
+		else modrm_idx = idx + 2;
+	} else if (op == 0xc5) {
+		modrm_idx = idx + 2;
+	} else if (op == 0xc4 || op == 0x8f || op == 0x62) {
+		modrm_idx = idx + 3;
+	} else {
+		modrm_idx = idx + 1;
+	}
+
+	if (modrm_idx >= 0 && modrm_idx < MAX_INSN_LENGTH) {
+		uint8_t modrm = b[modrm_idx];
+		if ((modrm & 0xc7) == 0x05) {
+			if (modrm_idx + 4 <= MAX_INSN_LENGTH) {
+				int32_t disp32 = (int32_t)(b[modrm_idx + 1] | 
+				                          (b[modrm_idx + 2] << 8) | 
+				                          (b[modrm_idx + 3] << 16) | 
+				                          (b[modrm_idx + 4] << 24));
+				if (disp32 >= -64 && disp32 <= 64) {
+					return true;
+				}
+			}
+		}
+	}
+#endif
+	return false;
+}
+
 bool modifies_sp(const uint8_t* b)
 {
 #if USE_CAPSTONE
-	uint8_t* c_code = (uint8_t*)b;
-	size_t c_size = MAX_INSN_LENGTH;
-	uint64_t c_addr = (uintptr_t)packet;
-	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &c_size, &c_addr, capstone_insn)) {
+	uint8_t* code = (uint8_t*)b;
+	size_t code_size = MAX_INSN_LENGTH;
+	uint64_t address = (uintptr_t)packet;
+	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
 		if (capstone_insn->detail) {
 			for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
 				uint16_t reg_w = capstone_insn->detail->regs_write[r];
@@ -657,10 +700,30 @@ bool has_opcode(const uint8_t* op, int op_len)
 	return false;
 }
 
-void inject(void)
+bool has_prefix(uint8_t* pre)
+{
+	int i, j;
+	for (i = 0; i < MAX_INSN_LENGTH; i++) {
+		if (is_prefix(inj.i.bytes[i])) {
+			j = 0;
+			do {
+				if (inj.i.bytes[i] == pre[j]) {
+					return true;
+				}
+				j++;
+			} while (pre[j]);
+		}
+		else {
+			return false;
+		}
+	}
+	return false;
+}
+
+void inject(int len)
 {
 	memset(arena_buffer, 0xCC, ARENA_SIZE);
-	memcpy(packet, inj.i.bytes, MAX_INSN_LENGTH);
+	memcpy(packet, inj.i.bytes, len);
 
 	if (!have_state) {
 		__asm__ __volatile__ ("ud2\n\t");
@@ -669,8 +732,10 @@ void inject(void)
 
 	uintptr_t* stk = (uintptr_t*)dummy_stack_area;
 	for (size_t s = 0; s < sizeof(dummy_stack_area) / sizeof(uintptr_t); s++) {
-		stk[s] = (uintptr_t)packet + MAX_INSN_LENGTH;
+		stk[s] = (uintptr_t)packet + len;
 	}
+
+	__asm__ __volatile__ ("emms\n\t");
 
 #if ARCH_X64
 	__asm__ __volatile__ (
@@ -714,6 +779,8 @@ void inject(void)
 
 LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 {
+	__asm__ __volatile__ ("emms\n\t");
+
 	if (!have_state) {
 		fault_context = *pExceptionInfo->ContextRecord;
 		fault_context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
@@ -736,33 +803,35 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	uint32_t signum = 0;
 	uint32_t si_code = 0;
 	uint32_t addr = (uint32_t)-1;
-	int insn_length = (int)(fault_ip - (uintptr_t)packet);
+	int fault_offset = (int)(fault_ip - (uintptr_t)packet);
+	int insn_length = 0;
 
 	if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
 		signum = SIGTRAP;
 		si_code = 1;
+		insn_length = fault_offset > 0 ? fault_offset : expected_length;
 	}
 	else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION) {
 		signum = SIGILL;
 		si_code = 1;
-		insn_length = expected_length > 0 ? expected_length : 1;
+		insn_length = fault_offset > 0 ? fault_offset : (expected_length > 0 ? expected_length : 1);
 	}
 	else if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
 		signum = SIGSEGV;
 		si_code = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
 		addr = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-		insn_length = expected_length > 0 ? expected_length : 1;
+		insn_length = fault_offset > 0 ? fault_offset : (expected_length > 0 ? expected_length : 1);
 	}
 	else if (code == EXCEPTION_DATATYPE_MISALIGNMENT) {
 		signum = SIGBUS;
 		si_code = 1;
 		addr = (uint32_t)(uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionAddress;
-		insn_length = expected_length > 0 ? expected_length : 1;
+		insn_length = fault_offset > 0 ? fault_offset : (expected_length > 0 ? expected_length : 1);
 	}
 	else {
 		signum = SIGFPE;
 		si_code = 1;
-		insn_length = expected_length > 0 ? expected_length : 1;
+		insn_length = fault_offset > 0 ? fault_offset : (expected_length > 0 ? expected_length : 1);
 	}
 
 	if (insn_length <= 0 || insn_length > MAX_INSN_LENGTH) {
@@ -863,8 +932,8 @@ bool move_next_instruction(void)
 					inj.index = search_range.start.len;
 				}
 				else {
-					if (result.length != inj.last_len && inj.index < result.length - 1) {
-						inj.index++;
+					if (result.length != inj.last_len && inj.index < (int)result.length - 1) {
+						inj.index = (int)result.length - 1;
 					}
 					inj.last_len = result.length;
 
@@ -906,6 +975,14 @@ bool move_next_instruction(void)
 			continue;
 		}
 
+		if (is_rip_relative_self_modify(inj.i.bytes)) {
+			if (output == RAW) {
+				result = (result_t){0,0,0,0,0};
+				give_result(stdout);
+			}
+			continue;
+		}
+
 		if (modifies_sp(inj.i.bytes)) {
 			if (output == RAW) {
 				result = (result_t){0,0,0,0,0};
@@ -918,6 +995,20 @@ bool move_next_instruction(void)
 		i = 0;
 		while (opcode_blacklist[i].opcode) {
 			if (has_opcode(opcode_blacklist[i].opcode, opcode_blacklist[i].len)) {
+				if (output == RAW) {
+					result = (result_t){0,0,0,0,0};
+					give_result(stdout);
+				}
+				blacklisted = true;
+				break;
+			}
+			i++;
+		}
+		if (blacklisted) continue;
+
+		i = 0;
+		while (prefix_blacklist[i].prefix) {
+			if (has_prefix((uint8_t*)prefix_blacklist[i].prefix)) {
 				if (output == RAW) {
 					result = (result_t){0,0,0,0,0};
 					give_result(stdout);
@@ -965,7 +1056,7 @@ void give_result(FILE* f)
 				case TUNNEL:
 				case RAND:
 				case DRIVEN:
-					sync_fprintf(f, " %s", expected_length == result.length ? " " : ".");
+					sync_fprintf(f, " %s", expected_length == (int)result.length ? " " : ".");
 					sync_fprintf(f, "r: (%2d) ", result.length);
 					if (result.signum == SIGILL)  { sync_fprintf(f, "sigill "); }
 					if (result.signum == SIGSEGV) { sync_fprintf(f, "sigsegv"); }
@@ -1145,7 +1236,7 @@ int main(int argc, char** argv)
 				expected_length = branch_len;
 			}
 			else {
-				expected_length = 1;
+				expected_length = 0;
 #if USE_CAPSTONE
 				uint8_t* code = inj.i.bytes;
 				size_t code_size = MAX_INSN_LENGTH;
@@ -1156,7 +1247,11 @@ int main(int argc, char** argv)
 #endif
 			}
 
-			inject();
+			int inject_len = expected_length > 0 ? expected_length : (inj.index >= 0 ? inj.index + 1 : MAX_INSN_LENGTH);
+			if (inject_len > MAX_INSN_LENGTH) inject_len = MAX_INSN_LENGTH;
+			if (inject_len < 1) inject_len = 1;
+
+			inject(inject_len);
 
 			if (is_branch_insn(inj.i.bytes, NULL)) {
 				result.length = expected_length;
