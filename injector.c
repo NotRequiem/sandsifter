@@ -522,7 +522,7 @@ bool modifies_sp(const uint8_t* b)
 	uint8_t* c_code = (uint8_t*)b;
 	size_t c_size = MAX_INSN_LENGTH;
 	uint64_t c_addr = (uintptr_t)packet;
-	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &code_size, &c_addr, capstone_insn)) {
+	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &c_size, &c_addr, capstone_insn)) {
 		if (capstone_insn->detail) {
 			for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
 				uint16_t reg_w = capstone_insn->detail->regs_write[r];
