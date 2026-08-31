@@ -205,6 +205,7 @@ static int expected_length;
 bool is_prefix(uint8_t x);
 bool has_opcode(const uint8_t* op, int op_len);
 bool is_backward_branch(const uint8_t* b);
+bool is_indirect_branch(const uint8_t* b);
 bool is_branch_insn(const uint8_t* b, int* branch_len);
 bool modifies_sp(const uint8_t* b);
 void print_mc(FILE* f, int length);
@@ -490,13 +491,38 @@ bool is_backward_branch(const uint8_t* b)
 	return false;
 }
 
+bool is_indirect_branch(const uint8_t* b)
+{
+	int idx = 0;
+	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
+	if (idx >= MAX_INSN_LENGTH) return false;
+
+	uint8_t op = b[idx];
+
+	// Opcode 0xFF with ModR/M reg = 2, 3, 4, 5 (CALL r/m, CALL m_far, JMP r/m, JMP m_far)
+	if (op == 0xff && idx + 1 < MAX_INSN_LENGTH) {
+		uint8_t modrm = b[idx + 1];
+		uint8_t reg = (modrm >> 3) & 0x07;
+		if (reg >= 2 && reg <= 5) {
+			return true;
+		}
+	}
+
+	// Far direct jump/call imm
+	if (op == 0xea || op == 0x9a) {
+		return true;
+	}
+
+	return false;
+}
+
 bool modifies_sp(const uint8_t* b)
 {
 #if USE_CAPSTONE
 	uint8_t* c_code = (uint8_t*)b;
 	size_t c_size = MAX_INSN_LENGTH;
 	uint64_t c_addr = (uintptr_t)packet;
-	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &c_size, &c_addr, capstone_insn)) {
+	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &code_size, &c_addr, capstone_insn)) {
 		if (capstone_insn->detail) {
 			for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
 				uint16_t reg_w = capstone_insn->detail->regs_write[r];
@@ -865,6 +891,14 @@ bool move_next_instruction(void)
 		search_range.started = true;
 
 		if (is_backward_branch(inj.i.bytes)) {
+			if (output == RAW) {
+				result = (result_t){0,0,0,0,0};
+				give_result(stdout);
+			}
+			continue;
+		}
+
+		if (is_indirect_branch(inj.i.bytes)) {
 			if (output == RAW) {
 				result = (result_t){0,0,0,0,0};
 				give_result(stdout);
