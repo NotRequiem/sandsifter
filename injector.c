@@ -36,14 +36,8 @@
 #define UD2_SIZE  2
 #define ARENA_SIZE (64 * 1024)
 #define ARENA_OFFSET (32 * 1024)
-#define TF        0x100
 
 #define MAX_INSN_LENGTH 15
-
-#define LINE_BUFFER_SIZE 256
-#define BUFFER_LINES 16
-#define SYNC_LINES_STDOUT BUFFER_LINES
-#define SYNC_LINES_STDERR BUFFER_LINES
 
 #define TICK_MASK 0xffff
 #define RAW_REPORT_INSN_BYTES 16
@@ -142,7 +136,6 @@ typedef struct {
 	char* reason;
 } ignore_op_t;
 
-/* Minimal blacklist: Only instructions that destroy the OS kernel/TEB context */
 ignore_op_t opcode_blacklist[MAX_BLACKLIST] = {
 	{ (uint8_t*)"\x0f\x34", 2, "sysenter" },
 	{ (uint8_t*)"\x0f\x35", 2, "sysexit" },
@@ -157,7 +150,6 @@ ignore_op_t opcode_blacklist[MAX_BLACKLIST] = {
 	{ (uint8_t*)"\x0f\xae\xdd", 3, "wrgsbase" },
 	{ (uint8_t*)"\x0f\xae\xde", 3, "wrgsbase" },
 	{ (uint8_t*)"\x0f\xae\xdf", 3, "wrgsbase" },
-	{ (uint8_t*)"\x0f\xb9", 2, "ud2" },
 	{ (uint8_t*)"\x0f\xaa", 2, "rsm" },
 	{ NULL, 0, NULL }
 };
@@ -184,13 +176,6 @@ HANDLE pool_mutex = NULL;
 HANDLE output_mutex = NULL;
 HANDLE hMapRange = NULL;
 
-char stdout_buffer[LINE_BUFFER_SIZE * BUFFER_LINES];
-char* stdout_buffer_pos = stdout_buffer;
-int stdout_sync_counter = 0;
-char stderr_buffer[LINE_BUFFER_SIZE * BUFFER_LINES];
-char* stderr_buffer_pos = stderr_buffer;
-int stderr_sync_counter = 0;
-
 static char* optarg = NULL;
 static int optind = 1;
 static int opterr = 1;
@@ -201,6 +186,9 @@ static int expected_length;
 
 bool is_prefix(uint8_t x);
 bool has_opcode(const uint8_t* op, int op_len);
+bool is_backward_branch(const uint8_t* b);
+bool is_branch_insn(const uint8_t* b, int* branch_len);
+bool modifies_sp(const uint8_t* b);
 void print_mc(FILE* f, int length);
 void give_result(FILE* f);
 int prefix_count(void);
@@ -262,62 +250,24 @@ void sync_fprintf(FILE* f, const char *format, ...)
 {
 	va_list args;
 	va_start(args, format);
-
-	if (f == stdout) {
-		stdout_buffer_pos += vsprintf(stdout_buffer_pos, format, args);
-	}
-	else if (f == stderr) {
-		stderr_buffer_pos += vsprintf(stderr_buffer_pos, format, args);
-	}
-	else {
-		assert(0);
-	}
-
+	WaitForSingleObject(output_mutex, INFINITE);
+	vfprintf(f, format, args);
+	ReleaseMutex(output_mutex);
 	va_end(args);
 }
 
 void sync_fwrite(const void* ptr, size_t size, size_t count, FILE* f)
 {
-	if (f == stdout) {
-		memcpy(stdout_buffer_pos, ptr, size * count);
-		stdout_buffer_pos += size * count;
-	}
-	else if (f == stderr) {
-		memcpy(stderr_buffer_pos, ptr, size * count);
-		stderr_buffer_pos += size * count;
-	}
-	else {
-		assert(0);
-	}
+	WaitForSingleObject(output_mutex, INFINITE);
+	fwrite(ptr, size, count, f);
+	ReleaseMutex(output_mutex);
 }
 
 void sync_fflush(FILE* f, bool force)
 {
-	if (f == stdout) {
-		stdout_sync_counter++;
-		if (stdout_sync_counter >= SYNC_LINES_STDOUT || force) {
-			stdout_sync_counter = 0;
-			WaitForSingleObject(output_mutex, INFINITE);
-			fwrite(stdout_buffer, stdout_buffer_pos - stdout_buffer, 1, f);
-			fflush(f);
-			ReleaseMutex(output_mutex);
-			stdout_buffer_pos = stdout_buffer;
-		}
-	}
-	else if (f == stderr) {
-		stderr_sync_counter++;
-		if (stderr_sync_counter >= SYNC_LINES_STDERR || force) {
-			stderr_sync_counter = 0;
-			WaitForSingleObject(output_mutex, INFINITE);
-			fwrite(stderr_buffer, stderr_buffer_pos - stderr_buffer, 1, f);
-			fflush(f);
-			ReleaseMutex(output_mutex);
-			stderr_buffer_pos = stderr_buffer;
-		}
-	}
-	else {
-		assert(0);
-	}
+	WaitForSingleObject(output_mutex, INFINITE);
+	fflush(f);
+	ReleaseMutex(output_mutex);
 }
 
 void zero_insn_end(insn_t* insn, int marker)
@@ -452,6 +402,146 @@ bool is_prefix(uint8_t x)
 		;
 }
 
+bool is_branch_insn(const uint8_t* b, int* branch_len)
+{
+	int idx = 0;
+	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
+	if (idx >= MAX_INSN_LENGTH) return false;
+
+	uint8_t op = b[idx];
+
+	if ((op >= 0x70 && op <= 0x7f) || op == 0xeb || (op >= 0xe0 && op <= 0xe3)) {
+		if (branch_len) *branch_len = idx + 2;
+		return true;
+	}
+
+	if (op == 0x0f && idx + 1 < MAX_INSN_LENGTH) {
+		uint8_t op2 = b[idx + 1];
+		if (op2 >= 0x80 && op2 <= 0x8f) {
+			if (branch_len) *branch_len = idx + 6;
+			return true;
+		}
+	}
+
+	if (op == 0xe9 || op == 0xe8) {
+		if (branch_len) *branch_len = idx + 5;
+		return true;
+	}
+
+	return false;
+}
+
+bool is_backward_branch(const uint8_t* b)
+{
+	int idx = 0;
+	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
+	if (idx >= MAX_INSN_LENGTH) return false;
+
+	uint8_t op = b[idx];
+
+	if ((op >= 0x70 && op <= 0x7f) || op == 0xeb || (op >= 0xe0 && op <= 0xe3)) {
+		if (idx + 1 < MAX_INSN_LENGTH) {
+			int8_t disp8 = (int8_t)b[idx + 1];
+			if (disp8 <= 0) {
+				return true;
+			}
+		}
+	}
+
+	if (op == 0x0f && idx + 1 < MAX_INSN_LENGTH) {
+		uint8_t op2 = b[idx + 1];
+		if (op2 >= 0x80 && op2 <= 0x8f) {
+			if (idx + 5 < MAX_INSN_LENGTH) {
+				int32_t disp32 = (int32_t)(b[idx + 2] | (b[idx + 3] << 8) | 
+				                          (b[idx + 4] << 16) | (b[idx + 5] << 24));
+				if (disp32 <= 0) {
+					return true;
+				}
+			}
+		}
+	}
+
+	if (op == 0xe9 && idx + 4 < MAX_INSN_LENGTH) {
+		int32_t disp32 = (int32_t)(b[idx + 1] | (b[idx + 2] << 8) | 
+		                          (b[idx + 3] << 16) | (b[idx + 4] << 24));
+		if (disp32 <= 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool modifies_sp(const uint8_t* b)
+{
+#if USE_CAPSTONE
+	uint8_t* c_code = (uint8_t*)b;
+	size_t c_size = MAX_INSN_LENGTH;
+	uint64_t c_addr = (uintptr_t)packet;
+	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&c_code, &c_size, &c_addr, capstone_insn)) {
+		if (capstone_insn->detail) {
+			for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
+				uint16_t reg_w = capstone_insn->detail->regs_write[r];
+				if (reg_w == X86_REG_RSP || reg_w == X86_REG_ESP || reg_w == X86_REG_SP || reg_w == X86_REG_SPL) {
+					return true;
+				}
+			}
+			for (int op_i = 0; op_i < capstone_insn->detail->x86.op_count; op_i++) {
+				cs_x86_op* op_desc = &capstone_insn->detail->x86.operands[op_i];
+				if (op_desc->type == X86_OP_REG) {
+					if (op_desc->reg == X86_REG_RSP || op_desc->reg == X86_REG_ESP || 
+					    op_desc->reg == X86_REG_SP || op_desc->reg == X86_REG_SPL) {
+						if (op_desc->access & CS_AC_WRITE) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+#endif
+
+	int idx = 0;
+	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
+	if (idx >= MAX_INSN_LENGTH) return false;
+	
+	uint8_t op = b[idx];
+
+	if ((op >= 0x50 && op <= 0x5f) || op == 0x68 || op == 0x6a || 
+	    op == 0x9c || op == 0x9d || op == 0xc2 || op == 0xc3 || 
+	    op == 0xc8 || op == 0xc9 || op == 0xca || op == 0xcb || 
+	    op == 0xcc || op == 0xcd || op == 0xce || op == 0xcf || 
+	    op == 0xe8 || op == 0xbc || op == 0x9a) {
+		return true;
+	}
+
+	int modrm_idx = -1;
+	if (op == 0x0f) {
+		if (idx + 1 >= MAX_INSN_LENGTH) return false;
+		uint8_t op2 = b[idx + 1];
+		if (op2 == 0x38 || op2 == 0x3a) modrm_idx = idx + 3;
+		else modrm_idx = idx + 2;
+	} else if (op == 0xc5) {
+		modrm_idx = idx + 2;
+	} else if (op == 0xc4 || op == 0x8f || op == 0x62) {
+		modrm_idx = idx + 3;
+	} else {
+		modrm_idx = idx + 1;
+	}
+
+	if (modrm_idx >= 0 && modrm_idx < MAX_INSN_LENGTH) {
+		uint8_t modrm = b[modrm_idx];
+		uint8_t mod = modrm & 0xc0;
+		uint8_t reg = (modrm >> 3) & 0x07;
+		uint8_t rm = modrm & 0x07;
+
+		if (mod == 0xc0 && rm == 4) return true;
+		if (op == 0x8d && reg == 4) return true;
+	}
+
+	return false;
+}
+
 void print_mc(FILE* f, int length)
 {
 	int i;
@@ -525,11 +615,17 @@ bool has_opcode(const uint8_t* op, int op_len)
 
 void inject(void)
 {
+	memset(arena_buffer, 0xCC, ARENA_SIZE);
 	memcpy(packet, inj.i.bytes, MAX_INSN_LENGTH);
 
 	if (!have_state) {
 		__asm__ __volatile__ ("ud2\n\t");
 		have_state = true;
+	}
+
+	uintptr_t* stk = (uintptr_t*)dummy_stack_area;
+	for (size_t s = 0; s < sizeof(dummy_stack_area) / sizeof(uintptr_t); s++) {
+		stk[s] = (uintptr_t)packet + MAX_INSN_LENGTH;
 	}
 
 #if ARCH_X64
@@ -550,9 +646,6 @@ void inject(void)
 		"xorq %r14, %r14 \n\t"
 		"xorq %r15, %r15 \n\t"
 		"xorq %rbp, %rbp \n\t"
-		"pushfq \n\t"
-		"orq $0x100, (%rsp) \n\t" /* Set Trap Flag (Single-Step) */
-		"popfq \n\t"
 		"jmp *%r11 \n\t"
 	);
 #else
@@ -565,9 +658,6 @@ void inject(void)
 		"xorl %esi, %esi \n\t"
 		"xorl %edi, %edi \n\t"
 		"xorl %ebp, %ebp \n\t"
-		"pushfl \n\t"
-		"orl $0x100, (%esp) \n\t" /* Set Trap Flag (Single-Step) */
-		"popfl \n\t"
 		"jmp *%edx \n\t"
 	);
 #endif
@@ -602,38 +692,33 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	uint32_t signum = 0;
 	uint32_t si_code = 0;
 	uint32_t addr = (uint32_t)-1;
-	int insn_length = 0;
+	int insn_length = (int)(fault_ip - (uintptr_t)packet);
 
-	if (code == EXCEPTION_SINGLE_STEP) {
-		/* Hardware successfully executed 1 instruction and single-stepped */
+	if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
 		signum = SIGTRAP;
 		si_code = 1;
-		insn_length = (int)(fault_ip - (uintptr_t)packet);
-		if (insn_length <= 0 || insn_length > MAX_INSN_LENGTH) {
-			insn_length = expected_length;
-		}
 	}
 	else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION) {
 		signum = SIGILL;
 		si_code = 1;
-		insn_length = (int)(fault_ip - (uintptr_t)packet);
+		insn_length = expected_length > 0 ? expected_length : 1;
 	}
 	else if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
 		signum = SIGSEGV;
 		si_code = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
 		addr = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-		insn_length = (int)(fault_ip - (uintptr_t)packet);
+		insn_length = expected_length > 0 ? expected_length : 1;
 	}
 	else if (code == EXCEPTION_DATATYPE_MISALIGNMENT) {
 		signum = SIGBUS;
 		si_code = 1;
 		addr = (uint32_t)(uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionAddress;
-		insn_length = (int)(fault_ip - (uintptr_t)packet);
+		insn_length = expected_length > 0 ? expected_length : 1;
 	}
 	else {
 		signum = SIGFPE;
 		si_code = 1;
-		insn_length = (int)(fault_ip - (uintptr_t)packet);
+		insn_length = expected_length > 0 ? expected_length : 1;
 	}
 
 	if (insn_length <= 0 || insn_length > MAX_INSN_LENGTH) {
@@ -646,7 +731,6 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	result.si_code = si_code;
 	result.addr = addr;
 
-	/* Restore baseline registers and jump to safe resume label */
 	*pExceptionInfo->ContextRecord = fault_context;
 	pExceptionInfo->ContextRecord->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
 #if ARCH_X64
@@ -761,6 +845,22 @@ bool move_next_instruction(void)
 				assert(0);
 		}
 		search_range.started = true;
+
+		if (is_backward_branch(inj.i.bytes)) {
+			if (output == RAW) {
+				result = (result_t){0,0,0,0,0};
+				give_result(stdout);
+			}
+			continue;
+		}
+
+		if (modifies_sp(inj.i.bytes)) {
+			if (output == RAW) {
+				result = (result_t){0,0,0,0,0};
+				give_result(stdout);
+			}
+			continue;
+		}
 
 		bool blacklisted = false;
 		i = 0;
@@ -970,10 +1070,8 @@ int main(int argc, char** argv)
 	pin_core();
 	srand(config.seed);
 
-	/* Allocate 64KB arena: Candidate instructions run in the middle with 32KB padding around */
 	arena_buffer = VirtualAlloc(NULL, ARENA_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	assert(arena_buffer != NULL);
-	memset(arena_buffer, 0x90, ARENA_SIZE); /* Fill with NOPs */
 
 	packet = ((char*)arena_buffer) + ARENA_OFFSET;
 
@@ -990,16 +1088,28 @@ int main(int argc, char** argv)
 		while (move_next_instruction()) {
 			pretext();
 
-			expected_length = 1;
-#if USE_CAPSTONE
-			uint8_t* code = inj.i.bytes;
-			size_t code_size = MAX_INSN_LENGTH;
-			uint64_t address = (uintptr_t)packet;
-			if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-				expected_length = (int)(address - (uintptr_t)packet);
+			int branch_len = 0;
+			if (is_branch_insn(inj.i.bytes, &branch_len)) {
+				expected_length = branch_len;
 			}
+			else {
+				expected_length = 1;
+#if USE_CAPSTONE
+				uint8_t* code = inj.i.bytes;
+				size_t code_size = MAX_INSN_LENGTH;
+				uint64_t address = (uintptr_t)packet;
+				if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
+					expected_length = (int)(address - (uintptr_t)packet);
+				}
 #endif
+			}
+
 			inject();
+
+			if (is_branch_insn(inj.i.bytes, NULL)) {
+				result.length = expected_length;
+			}
+
 			give_result(stdout);
 			tick();
 		}
