@@ -22,7 +22,11 @@
 #define USE_CAPSTONE true
 
 #if USE_CAPSTONE
-	#include <capstone/capstone.h>
+	#if __has_include(<capstone/capstone.h>)
+		#include <capstone/capstone.h>
+	#else
+		#include "capstone.h"
+	#endif
 	csh capstone_handle;
 	cs_insn *capstone_insn;
 #endif
@@ -33,18 +37,11 @@
 #define SIGFPE  8
 #define SIGSEGV 11
 
-#define UD2_SIZE 2
 #define MAX_INSN_LENGTH 15
-
 #define TICK_MASK 0xffff
 #define RAW_REPORT_INSN_BYTES 16
-#define RAW_REPORT_DISAS_MNE false
-#define RAW_REPORT_DISAS_MNE_BYTES 16
-#define RAW_REPORT_DISAS_OPS false
-#define RAW_REPORT_DISAS_OPS_BYTES 32
 #define RAW_REPORT_DISAS_LEN true
 #define RAW_REPORT_DISAS_VAL true
-
 #define MAX_BLACKLIST 128
 
 typedef enum { BRUTE, RAND, TUNNEL, DRIVEN } search_mode_t;
@@ -61,7 +58,6 @@ struct {
 	bool force_core;
 	int core;
 	bool enable_null_access;
-	bool nx_support;
 } config = {
 	.allow_dup_prefix = false,
 	.max_prefix = 0,
@@ -73,22 +69,18 @@ struct {
 	.force_core = false,
 	.core = 0,
 	.enable_null_access = false,
-	.nx_support = true,
 };
 
 search_mode_t mode = TUNNEL;
 output_t output = TEXT;
 
-void* page_boundary_buffer = NULL;
-uint8_t* page_boundary = NULL;
-char* packet = NULL;
-size_t page_size = 4096;
-
+static uint8_t* exec_pages = NULL;
+static uint8_t* page_boundary = NULL;
 static uint8_t dummy_stack_area[65536] __attribute__ ((aligned(4096)));
 static uint8_t scratch_area[65536] __attribute__ ((aligned(4096)));
 
 typedef struct {
-	uint8_t bytes[MAX_INSN_LENGTH];
+	uint8_t bytes[RAW_REPORT_INSN_BYTES];
 	int len;
 } insn_t;
 
@@ -103,10 +95,8 @@ static const insn_t null_insn = {0};
 static uintptr_t saved_host_sp = 0;
 static void* target_jump_addr = NULL;
 static volatile bool in_target = false;
-
-static void* current_exec_addr = NULL;
-static uintptr_t last_fault_ip = 0;
-static uintptr_t last_fault_addr = 0;
+static volatile bool last_fault_was_fetch = false;
+static int expected_length = 0;
 
 #pragma pack(push, 1)
 typedef struct {
@@ -122,12 +112,6 @@ typedef struct {
 } result_t;
 
 typedef struct {
-#if RAW_REPORT_DISAS_MNE
-	char mne[RAW_REPORT_DISAS_MNE_BYTES];
-#endif
-#if RAW_REPORT_DISAS_OPS
-	char ops[RAW_REPORT_DISAS_OPS_BYTES];
-#endif
 #if RAW_REPORT_DISAS_LEN
 	int len;
 #endif
@@ -135,6 +119,12 @@ typedef struct {
 	int val;
 #endif
 } disas_t;
+
+typedef struct {
+	disas_t disas;
+	uint8_t raw_insn[RAW_REPORT_INSN_BYTES];
+	result_t result;
+} report_t;
 #pragma pack(pop)
 
 result_t result;
@@ -177,7 +167,6 @@ ignore_op_t opcode_blacklist[MAX_BLACKLIST] = {
 	{ (uint8_t*)"\xf1",         1, "icebp" },
 	{ (uint8_t*)"\xc8",         1, "enter" },
 	{ (uint8_t*)"\xc7\xf8",     2, "xbegin" },
-	{ (uint8_t*)"\x0f\xb9",     2, "ud2" },
 	{ (uint8_t*)"\xc2",         1, "ret imm16" },
 	{ (uint8_t*)"\xc3",         1, "ret" },
 	{ (uint8_t*)"\xca",         1, "retf imm16" },
@@ -201,7 +190,7 @@ typedef struct { insn_t start; insn_t end; bool started; } range_t;
 insn_t* range_marker = NULL;
 range_t search_range = {0};
 range_t total_range = {
-	.start = {.bytes = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, .len = 0},
+	.start = {.bytes = {0}, .len = 0},
 	.end   = {.bytes = {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff}, .len = 0},
 	.started = false
 };
@@ -216,7 +205,6 @@ static int opterr = 1;
 static int optopt = '?';
 
 extern char resume;
-static int expected_length = 0;
 
 bool is_prefix(uint8_t x);
 bool has_opcode(const uint8_t* op, int op_len);
@@ -309,8 +297,7 @@ void sync_fflush(FILE* f, bool force)
 
 void zero_insn_end(insn_t* insn, int marker)
 {
-	int i;
-	for (i = marker; i < MAX_INSN_LENGTH; i++) {
+	for (int i = marker; i < MAX_INSN_LENGTH; i++) {
 		insn->bytes[i] = 0;
 	}
 }
@@ -324,9 +311,7 @@ bool increment_range(insn_t* insn, int marker)
 		insn->bytes[i]++;
 		while (insn->bytes[i] == 0) {
 			i--;
-			if (i < 0) {
-				break;
-			}
+			if (i < 0) break;
 			insn->bytes[i]++;
 		}
 	}
@@ -338,11 +323,19 @@ bool increment_range(insn_t* insn, int marker)
 void initialize_ranges(void)
 {
 	if (range_marker == NULL) {
-		hMapRange = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(insn_t), NULL);
+		char map_name[128];
+		snprintf(map_name, sizeof(map_name), "Local\\SandsifterRange_%ld", config.seed);
+		hMapRange = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(insn_t), map_name);
+		if (hMapRange == NULL) {
+			hMapRange = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, map_name);
+		}
 		assert(hMapRange != NULL);
+		bool first_init = (GetLastError() != ERROR_ALREADY_EXISTS);
 		range_marker = (insn_t*)MapViewOfFile(hMapRange, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(insn_t));
 		assert(range_marker != NULL);
-		*range_marker = total_range.start;
+		if (first_init) {
+			*range_marker = total_range.start;
+		}
 	}
 }
 
@@ -400,20 +393,34 @@ bool move_next_range(void)
 }
 
 #if USE_CAPSTONE
+int update_disas(void)
+{
+	uint8_t* code = inj.i.bytes;
+	size_t code_size = MAX_INSN_LENGTH;
+	uint64_t address = 0;
+
+	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
+		expected_length = capstone_insn[0].size;
+		disas.len = expected_length;
+		disas.val = 1;
+	}
+	else {
+		expected_length = 0;
+		disas.len = 0;
+		disas.val = 0;
+	}
+	return expected_length;
+}
+
 int print_asm(FILE* f)
 {
 	if (output == TEXT) {
-		uint8_t* code = inj.i.bytes;
-		size_t code_size = MAX_INSN_LENGTH;
-		uint64_t address = (uintptr_t)packet;
-	
-		if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-			sync_fprintf(f, "%10s %-45s (%2d)", capstone_insn[0].mnemonic, capstone_insn[0].op_str, (int)(address - (uintptr_t)packet));
+		if (disas.val) {
+			sync_fprintf(f, "%10s %-45s (%2d)", capstone_insn[0].mnemonic, capstone_insn[0].op_str, disas.len);
 		}
 		else {
 			sync_fprintf(f, "%10s %-45s (%2d)", "(unk)", " ", 0);
 		}
-		expected_length = (int)(address - (uintptr_t)packet);
 	}
 	return 0;
 }
@@ -450,9 +457,7 @@ bool is_backward_branch(const uint8_t* b)
 	if ((op >= 0x70 && op <= 0x7f) || op == 0xeb || (op >= 0xe0 && op <= 0xe3)) {
 		if (idx + 1 < MAX_INSN_LENGTH) {
 			int8_t disp8 = (int8_t)b[idx + 1];
-			if (disp8 <= 0) {
-				return true;
-			}
+			if (disp8 <= 0) return true;
 		}
 	}
 
@@ -462,9 +467,7 @@ bool is_backward_branch(const uint8_t* b)
 			if (idx + 5 < MAX_INSN_LENGTH) {
 				int32_t disp32 = (int32_t)(b[idx + 2] | (b[idx + 3] << 8) | 
 				                          (b[idx + 4] << 16) | (b[idx + 5] << 24));
-				if (disp32 <= 0) {
-					return true;
-				}
+				if (disp32 <= 0) return true;
 			}
 		}
 	}
@@ -472,9 +475,7 @@ bool is_backward_branch(const uint8_t* b)
 	if (op == 0xe9 && idx + 4 < MAX_INSN_LENGTH) {
 		int32_t disp32 = (int32_t)(b[idx + 1] | (b[idx + 2] << 8) | 
 		                          (b[idx + 3] << 16) | (b[idx + 4] << 24));
-		if (disp32 <= 0) {
-			return true;
-		}
+		if (disp32 <= 0) return true;
 	}
 
 	return false;
@@ -487,18 +488,13 @@ bool is_indirect_branch(const uint8_t* b)
 	if (idx >= MAX_INSN_LENGTH) return false;
 
 	uint8_t op = b[idx];
-
 	if (op == 0xff && idx + 1 < MAX_INSN_LENGTH) {
 		uint8_t modrm = b[idx + 1];
 		uint8_t reg = (modrm >> 3) & 0x07;
-		if (reg >= 2 && reg <= 5) {
-			return true;
-		}
+		if (reg >= 2 && reg <= 5) return true;
 	}
 
-	if (op == 0xea || op == 0x9a) {
-		return true;
-	}
+	if (op == 0xea || op == 0x9a) return true;
 
 	return false;
 }
@@ -534,9 +530,7 @@ bool is_rip_relative_self_modify(const uint8_t* b)
 				                          (b[modrm_idx + 2] << 8) | 
 				                          (b[modrm_idx + 3] << 16) | 
 				                          (b[modrm_idx + 4] << 24));
-				if (disp32 >= -64 && disp32 <= 64) {
-					return true;
-				}
+				if (disp32 >= -64 && disp32 <= 64) return true;
 			}
 		}
 	}
@@ -546,33 +540,6 @@ bool is_rip_relative_self_modify(const uint8_t* b)
 
 bool modifies_sp(const uint8_t* b)
 {
-#if USE_CAPSTONE
-	uint8_t* code = (uint8_t*)b;
-	size_t code_size = MAX_INSN_LENGTH;
-	uint64_t address = (uintptr_t)packet;
-	if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-		if (capstone_insn->detail) {
-			for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
-				uint16_t reg_w = capstone_insn->detail->regs_write[r];
-				if (reg_w == X86_REG_RSP || reg_w == X86_REG_ESP || reg_w == X86_REG_SP || reg_w == X86_REG_SPL) {
-					return true;
-				}
-			}
-			for (int op_i = 0; op_i < capstone_insn->detail->x86.op_count; op_i++) {
-				cs_x86_op* op_desc = &capstone_insn->detail->x86.operands[op_i];
-				if (op_desc->type == X86_OP_REG) {
-					if (op_desc->reg == X86_REG_RSP || op_desc->reg == X86_REG_ESP || 
-					    op_desc->reg == X86_REG_SP || op_desc->reg == X86_REG_SPL) {
-						if (op_desc->access & CS_AC_WRITE) {
-							return true;
-						}
-					}
-				}
-			}
-		}
-	}
-#endif
-
 	int idx = 0;
 	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
 	if (idx >= MAX_INSN_LENGTH) return false;
@@ -586,31 +553,6 @@ bool modifies_sp(const uint8_t* b)
 	    op == 0xe8 || op == 0xbc || op == 0x9a) {
 		return true;
 	}
-
-	int modrm_idx = -1;
-	if (op == 0x0f) {
-		if (idx + 1 >= MAX_INSN_LENGTH) return false;
-		uint8_t op2 = b[idx + 1];
-		if (op2 == 0x38 || op2 == 0x3a) modrm_idx = idx + 3;
-		else modrm_idx = idx + 2;
-	} else if (op == 0xc5) {
-		modrm_idx = idx + 2;
-	} else if (op == 0xc4 || op == 0x8f || op == 0x62) {
-		modrm_idx = idx + 3;
-	} else {
-		modrm_idx = idx + 1;
-	}
-
-	if (modrm_idx >= 0 && modrm_idx < MAX_INSN_LENGTH) {
-		uint8_t modrm = b[modrm_idx];
-		uint8_t mod = modrm & 0xc0;
-		uint8_t reg = (modrm >> 3) & 0x07;
-		uint8_t rm = modrm & 0x07;
-
-		if (mod == 0xc0 && rm == 4) return true;
-		if (op == 0x8d && reg == 4) return true;
-	}
-
 	return false;
 }
 
@@ -633,22 +575,16 @@ void print_mc(FILE* f, int length)
 
 int prefix_count(void)
 {
-	int i;
-	for (i = 0; i < MAX_INSN_LENGTH; i++) {
-		if (!is_prefix(inj.i.bytes[i])) {
-			return i;
-		}
+	for (int i = 0; i < MAX_INSN_LENGTH; i++) {
+		if (!is_prefix(inj.i.bytes[i])) return i;
 	}
-	return i;
+	return MAX_INSN_LENGTH;
 }
 
 bool has_dup_prefix(void)
 {
-	int i;
-	int byte_count[256];
-	memset(byte_count, 0, 256 * sizeof(int));
-
-	for (i = 0; i < MAX_INSN_LENGTH; i++) {
+	int byte_count[256] = {0};
+	for (int i = 0; i < MAX_INSN_LENGTH; i++) {
 		if (is_prefix(inj.i.bytes[i])) {
 			byte_count[inj.i.bytes[i]]++;
 		}
@@ -656,45 +592,29 @@ bool has_dup_prefix(void)
 			break;
 		}
 	}
-
-	for (i = 0; i < 256; i++) {
-		if (byte_count[i] > 1) {
-			return true;
-		}
+	for (int i = 0; i < 256; i++) {
+		if (byte_count[i] > 1) return true;
 	}
-
 	return false;
 }
 
 bool has_opcode(const uint8_t* op, int op_len)
 {
-	int i, j;
-	for (i = 0; i < MAX_INSN_LENGTH; i++) {
-		if (!is_prefix(inj.i.bytes[i])) {
-			if (i + op_len > MAX_INSN_LENGTH) {
-				return false;
-			}
-			for (j = 0; j < op_len; j++) {
-				if (inj.i.bytes[i + j] != op[j]) {
-					return false;
-				}
-			}
-			return true;
-		}
+	int i = 0;
+	while (i < MAX_INSN_LENGTH && is_prefix(inj.i.bytes[i])) {
+		i++;
 	}
-	return false;
+	if (i + op_len > MAX_INSN_LENGTH) return false;
+	return memcmp(&inj.i.bytes[i], op, op_len) == 0;
 }
 
 bool has_prefix(uint8_t* pre)
 {
-	int i, j;
-	for (i = 0; i < MAX_INSN_LENGTH; i++) {
+	for (int i = 0; i < MAX_INSN_LENGTH; i++) {
 		if (is_prefix(inj.i.bytes[i])) {
-			j = 0;
+			int j = 0;
 			do {
-				if (inj.i.bytes[i] == pre[j]) {
-					return true;
-				}
+				if (inj.i.bytes[i] == pre[j]) return true;
 				j++;
 			} while (pre[j]);
 		}
@@ -707,18 +627,15 @@ bool has_prefix(uint8_t* pre)
 
 __attribute__((noinline)) void execute_target(void* addr)
 {
-	current_exec_addr = addr;
 	target_jump_addr = addr;
-	last_fault_ip = 0;
-	last_fault_addr = 0;
 
 	uintptr_t safe_target = (uintptr_t)(scratch_area + 32768);
-
 	uintptr_t* stk = (uintptr_t*)dummy_stack_area;
 	for (size_t s = 0; s < sizeof(dummy_stack_area) / sizeof(uintptr_t); s++) {
 		stk[s] = (uintptr_t)safe_target;
 	}
 
+	__asm__ __volatile__ ("cld\n\t");
 	__asm__ __volatile__ ("emms\n\t");
 	__asm__ __volatile__ ("fninit\n\t");
 	uint32_t default_mxcsr = 0x1f80;
@@ -758,15 +675,26 @@ __attribute__((noinline)) void execute_target(void* addr)
 		"movq %1, %%rbp \n\t"
 		"movq %1, %%r8  \n\t"
 		"movq %1, %%r9  \n\t"
-		"movq %1, %%r10 \n\t"
-		"movq %1, %%r11 \n\t"
 		"movq %1, %%r12 \n\t"
 		"movq %1, %%r13 \n\t"
 		"movq %1, %%r14 \n\t"
 		"movq %1, %%r15 \n\t"
-		"jmp *%2 \n\t"
+		"movq %%rsp, %%r10 \n\t"
+		"subq $8, %%r10 \n\t"
+		"movq %%ss, %%r11 \n\t"
+		"pushq %%r11 \n\t"
+		"pushq %%r10 \n\t"
+		"pushfq \n\t"
+		"orq $0x100, (%%rsp) \n\t"
+		"movq %%cs, %%r11 \n\t"
+		"pushq %%r11 \n\t"
+		"pushq %2 \n\t"
+		"movq %%rax, %%r10 \n\t"
+		"movq %%rax, %%r11 \n\t"
+		"iretq \n\t"
 		".globl resume \n\t"
 		"resume: \n\t"
+		"cld \n\t"
 		"movq %0, %%rsp \n\t"
 		"movdqu 0(%%rsp), %%xmm6 \n\t"
 		"movdqu 16(%%rsp), %%xmm7 \n\t"
@@ -789,8 +717,9 @@ __attribute__((noinline)) void execute_target(void* addr)
 		"popq %%rbx \n\t"
 		"emms \n\t"
 		"fninit \n\t"
+		"cld \n\t"
 		: "=m"(saved_host_sp)
-		: "r"(safe_target), "m"(target_jump_addr)
+		: "r"(safe_target), "r"(target_jump_addr)
 		: "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
 		  "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory"
 	);
@@ -805,13 +734,19 @@ __attribute__((noinline)) void execute_target(void* addr)
 		"movl %1, %%eax \n\t"
 		"movl %1, %%ebx \n\t"
 		"movl %1, %%ecx \n\t"
-		"movl %1, %%edx \n\t"
 		"movl %1, %%esi \n\t"
 		"movl %1, %%edi \n\t"
 		"movl %1, %%ebp \n\t"
-		"jmp *%2 \n\t"
+		"pushfl \n\t"
+		"orl $0x100, (%%esp) \n\t"
+		"movl %%cs, %%edx \n\t"
+		"pushl %%edx \n\t"
+		"pushl %2 \n\t"
+		"movl %%eax, %%edx \n\t"
+		"iretd \n\t"
 		".globl resume \n\t"
 		"resume: \n\t"
+		"cld \n\t"
 		"movl %0, %%esp \n\t"
 		"popl %%ebp \n\t"
 		"popl %%edi \n\t"
@@ -819,53 +754,14 @@ __attribute__((noinline)) void execute_target(void* addr)
 		"popl %%ebx \n\t"
 		"emms \n\t"
 		"fninit \n\t"
+		"cld \n\t"
 		: "=m"(saved_host_sp)
-		: "r"(safe_target), "m"(target_jump_addr)
+		: "r"(safe_target), "r"(target_jump_addr)
 		: "eax", "ecx", "edx", "memory"
 	);
 #endif
 
 	in_target = false;
-}
-
-void inject(void)
-{
-	int len;
-	result_t last_res = {0};
-
-	for (len = 1; len <= MAX_INSN_LENGTH; len++) {
-		uint8_t* test_loc = page_boundary - len;
-
-		memcpy(test_loc, inj.i.bytes, len);
-		execute_target(test_loc);
-
-		last_res = result;
-
-#if ARCH_X64
-		if (result.signum == SIGSEGV && 
-		    result.si_code == 8 && 
-		    last_fault_addr == (uintptr_t)page_boundary && 
-		    last_fault_ip < (uintptr_t)page_boundary) {
-			continue;
-		}
-#else
-		if (result.signum == SIGSEGV && 
-		    (result.si_code == 8 || (!config.nx_support && result.si_code == 0)) && 
-		    last_fault_addr == (uintptr_t)page_boundary && 
-		    last_fault_ip < (uintptr_t)page_boundary) {
-			continue;
-		}
-#endif
-
-		result = last_res;
-		result.length = len;
-		result.valid = 1;
-		return;
-	}
-
-	result = last_res;
-	result.length = MAX_INSN_LENGTH;
-	result.valid = 1;
 }
 
 LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
@@ -874,6 +770,7 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
+	__asm__ __volatile__ ("cld\n\t");
 	__asm__ __volatile__ ("emms\n\t");
 	__asm__ __volatile__ ("fninit\n\t");
 	uint32_t default_mxcsr = 0x1f80;
@@ -886,66 +783,89 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 #endif
 
 	DWORD code = pExceptionInfo->ExceptionRecord->ExceptionCode;
-	uint32_t signum = 0;
-	uint32_t si_code = 0;
-	uintptr_t addr = (uintptr_t)-1;
 	uintptr_t fault_addr = 0;
+	uint32_t access_type = 0;
 
+	if (pExceptionInfo->ExceptionRecord->NumberParameters > 0) {
+		access_type = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+	}
 	if (pExceptionInfo->ExceptionRecord->NumberParameters > 1) {
 		fault_addr = (uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
 	}
 
-	last_fault_ip = fault_ip;
-	last_fault_addr = fault_addr;
-
-	if (code == EXCEPTION_SINGLE_STEP || code == EXCEPTION_BREAKPOINT) {
-		signum = SIGTRAP;
-		si_code = 1;
-		addr = fault_ip;
+	if (code == EXCEPTION_ACCESS_VIOLATION && 
+	    (access_type == 8 || (fault_addr >= (uintptr_t)page_boundary && fault_addr < (uintptr_t)(page_boundary + 4096)))) {
+		last_fault_was_fetch = true;
 	}
-	else if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
-		uint32_t access_type = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-		
-		if (access_type == 8) {
-			if ((fault_ip >= (uintptr_t)page_boundary && fault_ip < (uintptr_t)page_boundary + page_size) ||
-			    (fault_ip >= (uintptr_t)scratch_area && fault_ip < (uintptr_t)scratch_area + sizeof(scratch_area))) {
-				signum = SIGTRAP;
-				si_code = 1;
-				addr = 0;
-			}
-			else {
-				signum = SIGSEGV;
-				si_code = 8;
-				addr = fault_addr;
-			}
+	else {
+		last_fault_was_fetch = false;
+
+		uint32_t signum = 0;
+		uint32_t si_code = 0;
+		uintptr_t addr = 0;
+
+		if (code == EXCEPTION_SINGLE_STEP) {
+			signum = SIGTRAP;
+			si_code = 1;
+			addr = 0;
 		}
-		else {
+		else if (code == EXCEPTION_BREAKPOINT) {
+			signum = SIGTRAP;
+			si_code = 1;
+			addr = fault_ip;
+		}
+		else if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
+			signum = SIGILL;
+			si_code = 1;
+			addr = fault_ip;
+		}
+		else if (code == EXCEPTION_PRIV_INSTRUCTION) {
+			signum = SIGSEGV;
+			si_code = 1;
+			addr = fault_ip;
+		}
+		else if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
 			signum = SIGSEGV;
 			si_code = access_type;
 			addr = fault_addr;
 		}
-	}
-	else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION) {
-		signum = SIGILL;
-		si_code = 1;
-		addr = fault_ip;
-	}
-	else if (code == EXCEPTION_DATATYPE_MISALIGNMENT) {
-		signum = SIGBUS;
-		si_code = 1;
-		addr = fault_addr;
-	}
-	else {
-		signum = SIGFPE;
-		si_code = 1;
-		addr = fault_ip;
+		else if (code == EXCEPTION_GUARD_PAGE || code == EXCEPTION_STACK_OVERFLOW) {
+			signum = SIGSEGV;
+			si_code = 1;
+			addr = fault_addr;
+		}
+		else if (code == EXCEPTION_DATATYPE_MISALIGNMENT || code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED) {
+			signum = SIGBUS;
+			si_code = 1;
+			addr = fault_addr;
+		}
+		else if (code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+		         code == EXCEPTION_INT_OVERFLOW ||
+		         code == EXCEPTION_FLT_DENORMAL_OPERAND ||
+		         code == EXCEPTION_FLT_DIVIDE_BY_ZERO ||
+		         code == EXCEPTION_FLT_INEXACT_RESULT ||
+		         code == EXCEPTION_FLT_INVALID_OPERATION ||
+		         code == EXCEPTION_FLT_OVERFLOW ||
+		         code == EXCEPTION_FLT_STACK_CHECK ||
+		         code == EXCEPTION_FLT_UNDERFLOW ||
+		         code == ERROR_FLOAT_MULTIPLE_TRAPS) {
+			signum = SIGFPE;
+			si_code = 1;
+			addr = fault_ip;
+		}
+		else {
+			signum = SIGILL;
+			si_code = 1;
+			addr = fault_ip;
+		}
+
+		result.valid = 1;
+		result.signum = signum;
+		result.si_code = si_code;
+		result.addr = addr;
 	}
 
-	result.valid = 1;
-	result.length = 0;
-	result.signum = signum;
-	result.si_code = si_code;
-	result.addr = addr;
+	pExceptionInfo->ContextRecord->EFlags &= ~0x0100;
 
 #if ARCH_X64
 	pExceptionInfo->ContextRecord->Rip = (uintptr_t)&resume;
@@ -956,6 +876,34 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 #endif
 
 	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void inject(void)
+{
+	result.valid = 0;
+	result.length = 0;
+	result.signum = 0;
+	result.si_code = 0;
+	result.addr = 0;
+
+	for (int k = 1; k <= MAX_INSN_LENGTH; k++) {
+		uint8_t* target = page_boundary - k;
+		memcpy(target, inj.i.bytes, k);
+
+		last_fault_was_fetch = false;
+		execute_target(target);
+
+		if (last_fault_was_fetch) {
+			continue;
+		}
+
+		result.length = k;
+		break;
+	}
+
+	if (result.length == 0) {
+		result.length = MAX_INSN_LENGTH;
+	}
 }
 
 void get_rand_insn_in_range(range_t* r)
@@ -969,9 +917,7 @@ void get_rand_insn_in_range(range_t* r)
 	i = MAX_INSN_LENGTH - 1;
 	while (i >= 0) {
 		inclusive_end[i]--;
-		if (inclusive_end[i] != 0xff) {
-			break;
-		}
+		if (inclusive_end[i] != 0xff) break;
 		i--;
 	}
 
@@ -1009,11 +955,8 @@ bool move_next_instruction(void)
 			case RAND:
 				if (!search_range.started) {
 					init_inj(&null_insn);
-					get_rand_insn_in_range(&search_range);
 				}
-				else {
-					get_rand_insn_in_range(&search_range);
-				}
+				get_rand_insn_in_range(&search_range);
 				break;
 			case BRUTE:
 				if (!search_range.started) {
@@ -1023,9 +966,7 @@ bool move_next_instruction(void)
 				else {
 					for (inj.index = config.brute_depth - 1; inj.index >= 0; inj.index--) {
 						inj.i.bytes[inj.index]++;
-						if (inj.i.bytes[inj.index]) {
-							break;
-						}
+						if (inj.i.bytes[inj.index]) break;
 					}
 				}
 				break;
@@ -1035,10 +976,11 @@ bool move_next_instruction(void)
 					inj.index = search_range.start.len;
 				}
 				else {
-					if (result.length != inj.last_len && inj.index < (int)result.length - 1) {
-						inj.index = (int)result.length - 1;
+					int eff_len = result.length > 0 ? (int)result.length : (expected_length > 0 ? expected_length : 1);
+					if (eff_len != inj.last_len && inj.index < eff_len - 1) {
+						inj.index = eff_len - 1;
 					}
-					inj.last_len = result.length;
+					inj.last_len = eff_len;
 
 					inj.i.bytes[inj.index]++;
 
@@ -1062,46 +1004,15 @@ bool move_next_instruction(void)
 		}
 		search_range.started = true;
 
-		if (is_backward_branch(inj.i.bytes)) {
-			if (output == RAW) {
-				result = (result_t){0,0,0,0,0};
-				give_result(stdout);
-			}
-			continue;
-		}
-
-		if (is_indirect_branch(inj.i.bytes)) {
-			if (output == RAW) {
-				result = (result_t){0,0,0,0,0};
-				give_result(stdout);
-			}
-			continue;
-		}
-
-		if (is_rip_relative_self_modify(inj.i.bytes)) {
-			if (output == RAW) {
-				result = (result_t){0,0,0,0,0};
-				give_result(stdout);
-			}
-			continue;
-		}
-
-		if (modifies_sp(inj.i.bytes)) {
-			if (output == RAW) {
-				result = (result_t){0,0,0,0,0};
-				give_result(stdout);
-			}
-			continue;
-		}
+		if (is_backward_branch(inj.i.bytes)) continue;
+		if (is_indirect_branch(inj.i.bytes)) continue;
+		if (is_rip_relative_self_modify(inj.i.bytes)) continue;
+		if (modifies_sp(inj.i.bytes)) continue;
 
 		bool blacklisted = false;
 		i = 0;
 		while (opcode_blacklist[i].opcode) {
 			if (has_opcode(opcode_blacklist[i].opcode, opcode_blacklist[i].len)) {
-				if (output == RAW) {
-					result = (result_t){0,0,0,0,0};
-					give_result(stdout);
-				}
 				blacklisted = true;
 				break;
 			}
@@ -1112,10 +1023,6 @@ bool move_next_instruction(void)
 		i = 0;
 		while (prefix_blacklist[i].prefix) {
 			if (has_prefix((uint8_t*)prefix_blacklist[i].prefix)) {
-				if (output == RAW) {
-					result = (result_t){0,0,0,0,0};
-					give_result(stdout);
-				}
 				blacklisted = true;
 				break;
 			}
@@ -1124,10 +1031,6 @@ bool move_next_instruction(void)
 		if (blacklisted) continue;
 
 		if (prefix_count() > config.max_prefix || (!config.allow_dup_prefix && has_dup_prefix())) {
-			if (output == RAW) {
-				result = (result_t){0,0,0,0,0};
-				give_result(stdout);
-			}
 			continue;
 		}
 
@@ -1136,16 +1039,11 @@ bool move_next_instruction(void)
 		}
 
 		switch (mode) {
-			case RAND:
-				return true;
-			case BRUTE:
-				return inj.index >= 0;
-			case TUNNEL:
-				return inj.index >= 0;
-			case DRIVEN:
-				return true;
-			default:
-				assert(0);
+			case RAND:   return true;
+			case BRUTE:  return inj.index >= 0;
+			case TUNNEL: return inj.index >= 0;
+			case DRIVEN: return true;
+			default:     assert(0);
 		}
 	}
 }
@@ -1154,66 +1052,35 @@ void give_result(FILE* f)
 {
 	switch (output) {
 		case TEXT:
-			switch (mode) {
-				case BRUTE:
-				case TUNNEL:
-				case RAND:
-				case DRIVEN:
-					sync_fprintf(f, " %s", expected_length == (int)result.length ? " " : ".");
-					sync_fprintf(f, "r: (%2d) ", result.length);
-					if (result.signum == SIGILL)  { sync_fprintf(f, "sigill "); }
-					if (result.signum == SIGSEGV) { sync_fprintf(f, "sigsegv"); }
-					if (result.signum == SIGFPE)  { sync_fprintf(f, "sigfpe "); }
-					if (result.signum == SIGBUS)  { sync_fprintf(f, "sigbus "); }
-					if (result.signum == SIGTRAP) { sync_fprintf(f, "sigtrap"); }
-					sync_fprintf(f, " %3d ", result.si_code);
+			sync_fprintf(f, " %s", expected_length == (int)result.length ? " " : ".");
+			sync_fprintf(f, "r: (%2d) ", result.length);
+			if (result.signum == SIGILL)  { sync_fprintf(f, "sigill "); }
+			if (result.signum == SIGSEGV) { sync_fprintf(f, "sigsegv"); }
+			if (result.signum == SIGFPE)  { sync_fprintf(f, "sigfpe "); }
+			if (result.signum == SIGBUS)  { sync_fprintf(f, "sigbus "); }
+			if (result.signum == SIGTRAP) { sync_fprintf(f, "sigtrap"); }
+			sync_fprintf(f, " %3d ", result.si_code);
 #if ARCH_X64
-					sync_fprintf(f, " %016llx ", (unsigned long long)result.addr);
+			sync_fprintf(f, " %016llx ", (unsigned long long)result.addr);
 #else
-					sync_fprintf(f, " %08x ", result.addr);
+			sync_fprintf(f, " %08x ", result.addr);
 #endif
-					print_mc(f, result.length);
-					sync_fprintf(f, "\n");
-					break;
-				default:
-					assert(0);
-			}
+			print_mc(f, result.length);
+			sync_fprintf(f, "\n");
 			break;
 		case RAW:
-#if USE_CAPSTONE
 			{
-				uint8_t* code = inj.i.bytes;
-				size_t code_size = MAX_INSN_LENGTH;
-				uint64_t address = (uintptr_t)packet;
-			
-				if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-#if RAW_REPORT_DISAS_LEN
-					disas.len = (int)(address - (uintptr_t)packet);
-#endif
-#if RAW_REPORT_DISAS_VAL
-					disas.val = true;
-#endif
-				}
-				else {
-#if RAW_REPORT_DISAS_LEN
-					disas.len = 0;
-#endif
-#if RAW_REPORT_DISAS_VAL
-					disas.val = false;
-#endif
-				}
-#if RAW_REPORT_DISAS_MNE || RAW_REPORT_DISAS_OPS || RAW_REPORT_DISAS_LEN
-				sync_fwrite(&disas, sizeof(disas), 1, stdout);
-#endif
+				report_t report = {0};
+				report.disas = disas;
+				memcpy(report.raw_insn, inj.i.bytes, RAW_REPORT_INSN_BYTES);
+				report.result = result;
+				sync_fwrite(&report, sizeof(report), 1, f);
 			}
-#endif
-			sync_fwrite(inj.i.bytes, RAW_REPORT_INSN_BYTES, 1, stdout);
-			sync_fwrite(&result, sizeof(result), 1, stdout);
 			break;
 		default:
 			assert(0);
 	}
-	sync_fflush(stdout, false);
+	sync_fflush(f, false);
 }
 
 void init_config(int argc, char** argv)
@@ -1221,7 +1088,7 @@ void init_config(int argc, char** argv)
 	int c, i;
 	opterr = 0;
 	bool seed_given = false;
-	while ((c = getopt(argc, argv, "?brtdRTx0Ns:DB:P:S:i:e:c:X:j:l:")) != -1) {
+	while ((c = getopt(argc, argv, "?brtdRTx0s:DB:P:S:i:e:c:X:j:l:")) != -1) {
 		switch (c) {
 			case 'b': mode = BRUTE; break;
 			case 'r': mode = RAND; break;
@@ -1231,7 +1098,6 @@ void init_config(int argc, char** argv)
 			case 'T': output = TEXT; break;
 			case 'x': config.show_tick = true; break;
 			case '0': config.enable_null_access = true; break;
-			case 'N': config.nx_support = false; break;
 			case 's': sscanf(optarg, "%ld", &config.seed); seed_given = true; break;
 			case 'P': sscanf(optarg, "%d", &config.max_prefix); break;
 			case 'B': sscanf(optarg, "%d", &config.brute_depth); break;
@@ -1241,7 +1107,7 @@ void init_config(int argc, char** argv)
 				while (optarg[i * 2] && optarg[i * 2 + 1] && i < MAX_INSN_LENGTH) {
 					unsigned int k;
 					sscanf(optarg + i * 2, "%02x", &k);
-					total_range.start.bytes[i] = k;
+					total_range.start.bytes[i] = (uint8_t)k;
 					i++;
 				}
 				total_range.start.len = i;
@@ -1251,7 +1117,7 @@ void init_config(int argc, char** argv)
 				while (optarg[i * 2] && optarg[i * 2 + 1] && i < MAX_INSN_LENGTH) {
 					unsigned int k;
 					sscanf(optarg + i * 2, "%02x", &k);
-					total_range.end.bytes[i] = k;
+					total_range.end.bytes[i] = (uint8_t)k;
 					i++;
 				}
 				total_range.end.len = i;
@@ -1279,15 +1145,17 @@ void tick(void)
 	if (config.show_tick) {
 		t++;
 		if ((t & TICK_MASK) == 0) {
-			sync_fprintf(stderr, "t: ");
-			print_mc(stderr, 8);
-			sync_fprintf(stderr, "... ");
-			#if USE_CAPSTONE
-			print_asm(stderr);
-			sync_fprintf(stderr, "\t");
-			#endif
-			give_result(stderr);
-			sync_fflush(stderr, false);
+			if (output == TEXT) {
+				sync_fprintf(stderr, "t: ");
+				print_mc(stderr, 8);
+				sync_fprintf(stderr, "... ");
+				#if USE_CAPSTONE
+				print_asm(stderr);
+				sync_fprintf(stderr, "\t");
+				#endif
+				give_result(stderr);
+				sync_fflush(stderr, false);
+			}
 		}
 	}
 }
@@ -1313,31 +1181,28 @@ int main(int argc, char** argv)
 	_setmode(_fileno(stdout), _O_BINARY);
 	_setmode(_fileno(stderr), _O_BINARY);
 
-	pool_mutex = CreateMutexA(NULL, FALSE, NULL);
-	output_mutex = CreateMutexA(NULL, FALSE, NULL);
-
 	init_config(argc, argv);
 	pin_core();
 	srand(config.seed);
 
-	SYSTEM_INFO si;
-	GetSystemInfo(&si);
-	page_size = si.dwPageSize;
-	if (page_size < 4096) page_size = 4096;
+	char mutex_pool_name[128];
+	char mutex_out_name[128];
+	snprintf(mutex_pool_name, sizeof(mutex_pool_name), "Local\\SandsifterPool_%ld", config.seed);
+	snprintf(mutex_out_name, sizeof(mutex_out_name), "Local\\SandsifterOut_%ld", config.seed);
+	pool_mutex = CreateMutexA(NULL, FALSE, mutex_pool_name);
+	output_mutex = CreateMutexA(NULL, FALSE, mutex_out_name);
 
 	if (config.enable_null_access) {
 		VirtualAlloc((void*)1, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	}
 
-	page_boundary_buffer = VirtualAlloc(NULL, 2 * page_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-	assert(page_boundary_buffer != NULL);
+	exec_pages = (uint8_t*)VirtualAlloc(NULL, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	assert(exec_pages != NULL);
 
-	page_boundary = (uint8_t*)page_boundary_buffer + page_size;
-	DWORD old_protect;
-	BOOL ok = VirtualProtect(page_boundary, page_size, PAGE_NOACCESS, &old_protect);
-	assert(ok);
-
-	packet = (char*)(page_boundary - MAX_INSN_LENGTH);
+	DWORD old_prot;
+	VirtualProtect(exec_pages, 4096, PAGE_EXECUTE_READWRITE, &old_prot);
+	VirtualProtect(exec_pages + 4096, 4096, PAGE_NOACCESS, &old_prot);
+	page_boundary = exec_pages + 4096;
 
 #if USE_CAPSTONE
 	if (cs_open(CS_ARCH_X86, CS_MODE, &capstone_handle) != CS_ERR_OK) exit(1);
@@ -1350,11 +1215,11 @@ int main(int argc, char** argv)
 
 	while (move_next_range()) {
 		while (move_next_instruction()) {
-			expected_length = 0;
+#if USE_CAPSTONE
+			update_disas();
+#endif
 			pretext();
-
 			inject();
-
 			give_result(stdout);
 			tick();
 		}
@@ -1368,7 +1233,7 @@ int main(int argc, char** argv)
 	cs_close(&capstone_handle);
 #endif
 
-	VirtualFree(page_boundary_buffer, 0, MEM_RELEASE);
+	VirtualFree(exec_pages, 0, MEM_RELEASE);
 	free_ranges();
 	CloseHandle(pool_mutex);
 	CloseHandle(output_mutex);
