@@ -33,10 +33,7 @@
 #define SIGFPE  8
 #define SIGSEGV 11
 
-#define UD2_SIZE  2
-#define PAGE_SIZE 4096
-#define ARENA_SIZE (PAGE_SIZE * 2)
-
+#define UD2_SIZE 2
 #define MAX_INSN_LENGTH 15
 
 #define TICK_MASK 0xffff
@@ -82,9 +79,11 @@ struct {
 search_mode_t mode = TUNNEL;
 output_t output = TEXT;
 
-void* arena_buffer = NULL;
+void* page_boundary_buffer = NULL;
+uint8_t* page_boundary = NULL;
 char* packet = NULL;
-uint8_t* guard_boundary = NULL;
+size_t page_size = 4096;
+
 static uint8_t dummy_stack_area[65536] __attribute__ ((aligned(4096)));
 static uint8_t scratch_area[65536] __attribute__ ((aligned(4096)));
 
@@ -103,8 +102,10 @@ inj_t inj;
 static const insn_t null_insn = {0};
 static CONTEXT fault_context;
 static bool have_state = false;
-static uintptr_t last_fault_addr = 0;
+
+static void* current_exec_addr = NULL;
 static uintptr_t last_fault_ip = 0;
+static uintptr_t last_fault_addr = 0;
 
 #pragma pack(push, 1)
 typedef struct {
@@ -207,20 +208,19 @@ static int opterr = 1;
 static int optopt = '?';
 
 extern char resume;
-static int expected_length;
-static void* current_exec_addr = NULL;
+static int expected_length = 0;
 
 bool is_prefix(uint8_t x);
 bool has_opcode(const uint8_t* op, int op_len);
 bool is_backward_branch(const uint8_t* b);
 bool is_indirect_branch(const uint8_t* b);
 bool is_rip_relative_self_modify(const uint8_t* b);
-bool is_branch_insn(const uint8_t* b, int* branch_len);
 bool modifies_sp(const uint8_t* b);
 void print_mc(FILE* f, int length);
 void give_result(FILE* f);
 int prefix_count(void);
 bool has_dup_prefix(void);
+void inject(void);
 void execute_target(void* addr);
 bool move_next_instruction(void);
 bool move_next_range(void);
@@ -402,7 +402,7 @@ int print_asm(FILE* f)
 			sync_fprintf(f, "%10s %-45s (%2d)", capstone_insn[0].mnemonic, capstone_insn[0].op_str, (int)(address - (uintptr_t)packet));
 		}
 		else {
-			sync_fprintf(f, "%10s %-45s (%2d)", "(unk)", " ", (int)(address - (uintptr_t)packet));
+			sync_fprintf(f, "%10s %-45s (%2d)", "(unk)", " ", 0);
 		}
 		expected_length = (int)(address - (uintptr_t)packet);
 	}
@@ -428,35 +428,6 @@ bool is_prefix(uint8_t x)
 		|| (x >= 0x40 && x <= 0x4f)
 #endif
 		;
-}
-
-bool is_branch_insn(const uint8_t* b, int* branch_len)
-{
-	int idx = 0;
-	while (idx < MAX_INSN_LENGTH && is_prefix(b[idx])) idx++;
-	if (idx >= MAX_INSN_LENGTH) return false;
-
-	uint8_t op = b[idx];
-
-	if ((op >= 0x70 && op <= 0x7f) || op == 0xeb || (op >= 0xe0 && op <= 0xe3)) {
-		if (branch_len) *branch_len = idx + 2;
-		return true;
-	}
-
-	if (op == 0x0f && idx + 1 < MAX_INSN_LENGTH) {
-		uint8_t op2 = b[idx + 1];
-		if (op2 >= 0x80 && op2 <= 0x8f) {
-			if (branch_len) *branch_len = idx + 6;
-			return true;
-		}
-	}
-
-	if (op == 0xe9 || op == 0xe8) {
-		if (branch_len) *branch_len = idx + 5;
-		return true;
-	}
-
-	return false;
 }
 
 bool is_backward_branch(const uint8_t* b)
@@ -728,6 +699,8 @@ bool has_prefix(uint8_t* pre)
 void execute_target(void* addr)
 {
 	current_exec_addr = addr;
+	last_fault_ip = 0;
+	last_fault_addr = 0;
 
 	if (!have_state) {
 		__asm__ __volatile__ ("ud2\n\t");
@@ -738,7 +711,7 @@ void execute_target(void* addr)
 
 	uintptr_t* stk = (uintptr_t*)dummy_stack_area;
 	for (size_t s = 0; s < sizeof(dummy_stack_area) / sizeof(uintptr_t); s++) {
-		stk[s] = (uintptr_t)addr + MAX_INSN_LENGTH;
+		stk[s] = (uintptr_t)safe_target;
 	}
 
 	__asm__ __volatile__ ("emms\n\t");
@@ -789,6 +762,42 @@ void execute_target(void* addr)
 	);
 }
 
+void inject(void)
+{
+	int len;
+	result_t last_res = {0};
+
+	for (len = 1; len <= MAX_INSN_LENGTH; len++) {
+		uint8_t* test_loc = page_boundary - len;
+
+		// Copy candidate bytes directly to the boundary of Page 0
+		memcpy(test_loc, inj.i.bytes, len);
+
+		// Execute from test_loc
+		execute_target(test_loc);
+
+		last_res = result;
+
+		// If the CPU faulted during instruction fetch across the PAGE_NOACCESS boundary,
+		// the instruction requires more than len bytes to decode.
+		if (result.signum == SIGSEGV && 
+		    last_fault_addr == (uintptr_t)page_boundary && 
+		    last_fault_ip < (uintptr_t)page_boundary) {
+			continue;
+		}
+
+		// The CPU decoded the instruction within len bytes
+		result = last_res;
+		result.length = len;
+		result.valid = 1;
+		return;
+	}
+
+	result = last_res;
+	result.length = MAX_INSN_LENGTH;
+	result.valid = 1;
+}
+
 LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 {
 	__asm__ __volatile__ ("emms\n\t");
@@ -816,8 +825,6 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	uint32_t si_code = 0;
 	uint32_t addr = (uint32_t)-1;
 	uintptr_t fault_addr = 0;
-	int fault_offset = (int)(fault_ip - (uintptr_t)current_exec_addr);
-	int insn_length = 0;
 
 	if (pExceptionInfo->ExceptionRecord->NumberParameters > 1) {
 		fault_addr = (uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
@@ -827,43 +834,44 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	last_fault_addr = fault_addr;
 
 	if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
-		if (fault_addr == (uintptr_t)guard_boundary && fault_ip == (uintptr_t)guard_boundary && fault_offset > 0) {
+		// If fault_ip >= page_boundary, the instruction finished executing
+		// and reached or jumped into the PAGE_NOACCESS guard page.
+		if (fault_ip >= (uintptr_t)page_boundary) {
 			signum = SIGTRAP;
 			si_code = 1;
-			insn_length = fault_offset;
 			addr = 0;
 		}
+		// If fault_ip < page_boundary, this was either an instruction-fetch fault during decode
+		// (if fault_addr == page_boundary) or a memory operand fault.
 		else {
 			signum = SIGSEGV;
 			si_code = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
 			addr = (uint32_t)fault_addr;
-			insn_length = fault_offset > 0 ? fault_offset : 0;
 		}
 	}
 	else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION) {
 		signum = SIGILL;
 		si_code = 1;
-		insn_length = fault_offset > 0 ? fault_offset : 0;
+		addr = (uint32_t)fault_ip;
 	}
 	else if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
 		signum = SIGTRAP;
 		si_code = 1;
-		insn_length = fault_offset > 0 ? fault_offset : 1;
+		addr = (uint32_t)fault_ip;
 	}
 	else if (code == EXCEPTION_DATATYPE_MISALIGNMENT) {
 		signum = SIGBUS;
 		si_code = 1;
-		addr = (uint32_t)(uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionAddress;
-		insn_length = fault_offset > 0 ? fault_offset : 0;
+		addr = (uint32_t)fault_addr;
 	}
 	else {
 		signum = SIGFPE;
 		si_code = 1;
-		insn_length = fault_offset > 0 ? fault_offset : 0;
+		addr = (uint32_t)fault_ip;
 	}
 
 	result.valid = 1;
-	result.length = insn_length;
+	result.length = 0;
 	result.signum = signum;
 	result.si_code = si_code;
 	result.addr = addr;
@@ -877,26 +885,6 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 #endif
 
 	return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-void inject(void)
-{
-	int k;
-	for (k = 1; k <= MAX_INSN_LENGTH; k++) {
-		uint8_t* test_loc = guard_boundary - k;
-		memcpy(test_loc, inj.i.bytes, k);
-
-		execute_target(test_loc);
-
-		if (result.signum == SIGSEGV && last_fault_addr == (uintptr_t)guard_boundary) {
-			continue;
-		}
-
-		result.length = k;
-		return;
-	}
-
-	result.length = MAX_INSN_LENGTH;
 }
 
 void get_rand_insn_in_range(range_t* r)
@@ -1133,7 +1121,7 @@ void give_result(FILE* f)
 				}
 				else {
 #if RAW_REPORT_DISAS_LEN
-					disas.len = (int)(address - (uintptr_t)packet);
+					disas.len = 0;
 #endif
 #if RAW_REPORT_DISAS_VAL
 					disas.val = false;
@@ -1257,17 +1245,24 @@ int main(int argc, char** argv)
 	pin_core();
 	srand(config.seed);
 
-	arena_buffer = VirtualAlloc(NULL, ARENA_SIZE, MEM_RESERVE, PAGE_NOACCESS);
-	assert(arena_buffer != NULL);
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	page_size = si.dwPageSize;
+	if (page_size < 4096) page_size = 4096;
 
-	void* page0 = VirtualAlloc(arena_buffer, PAGE_SIZE, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-	assert(page0 != NULL);
+	// 2 Contiguous Pages: Page 0 (RWX) and Page 1 (PAGE_NOACCESS)
+	page_boundary_buffer = VirtualAlloc(NULL, 2 * page_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	assert(page_boundary_buffer != NULL);
 
-	void* page1 = VirtualAlloc((uint8_t*)arena_buffer + PAGE_SIZE, PAGE_SIZE, MEM_COMMIT, PAGE_NOACCESS);
-	assert(page1 != NULL);
+	DWORD old_protect;
+	BOOL ok1 = VirtualProtect(page_boundary_buffer, page_size, PAGE_EXECUTE_READWRITE, &old_protect);
+	assert(ok1);
 
-	packet = (char*)page0;
-	guard_boundary = ((uint8_t*)arena_buffer) + PAGE_SIZE;
+	page_boundary = (uint8_t*)page_boundary_buffer + page_size;
+	BOOL ok2 = VirtualProtect(page_boundary, page_size, PAGE_NOACCESS, &old_protect);
+	assert(ok2);
+
+	packet = (char*)(page_boundary - MAX_INSN_LENGTH);
 
 #if USE_CAPSTONE
 	if (cs_open(CS_ARCH_X86, CS_MODE, &capstone_handle) != CS_ERR_OK) exit(1);
@@ -1282,27 +1277,17 @@ int main(int argc, char** argv)
 		while (move_next_instruction()) {
 			pretext();
 
-			int branch_len = 0;
-			if (is_branch_insn(inj.i.bytes, &branch_len)) {
-				expected_length = branch_len;
-			}
-			else {
-				expected_length = 0;
+			expected_length = 0;
 #if USE_CAPSTONE
-				uint8_t* code = inj.i.bytes;
-				size_t code_size = MAX_INSN_LENGTH;
-				uint64_t address = (uintptr_t)packet;
-				if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-					expected_length = (int)(address - (uintptr_t)packet);
-				}
-#endif
+			uint8_t* code = inj.i.bytes;
+			size_t code_size = MAX_INSN_LENGTH;
+			uint64_t address = (uintptr_t)packet;
+			if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
+				expected_length = (int)(address - (uintptr_t)packet);
 			}
+#endif
 
 			inject();
-
-			if (is_branch_insn(inj.i.bytes, NULL)) {
-				result.length = expected_length;
-			}
 
 			give_result(stdout);
 			tick();
@@ -1317,7 +1302,7 @@ int main(int argc, char** argv)
 	cs_close(&capstone_handle);
 #endif
 
-	VirtualFree(arena_buffer, 0, MEM_RELEASE);
+	VirtualFree(page_boundary_buffer, 0, MEM_RELEASE);
 	free_ranges();
 	CloseHandle(pool_mutex);
 	CloseHandle(output_mutex);
