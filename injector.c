@@ -34,8 +34,8 @@
 #define SIGSEGV 11
 
 #define UD2_SIZE  2
-#define ARENA_SIZE (64 * 1024)
-#define ARENA_OFFSET (32 * 1024)
+#define PAGE_SIZE 4096
+#define ARENA_SIZE (PAGE_SIZE * 2)
 
 #define MAX_INSN_LENGTH 15
 
@@ -84,6 +84,7 @@ output_t output = TEXT;
 
 void* arena_buffer = NULL;
 char* packet = NULL;
+uint8_t* guard_boundary = NULL;
 static uint8_t dummy_stack_area[65536] __attribute__ ((aligned(4096)));
 
 typedef struct {
@@ -204,6 +205,7 @@ static int optopt = '?';
 
 extern char resume;
 static int expected_length;
+static void* current_exec_addr = NULL;
 
 bool is_prefix(uint8_t x);
 bool has_opcode(const uint8_t* op, int op_len);
@@ -216,7 +218,7 @@ void print_mc(FILE* f, int length);
 void give_result(FILE* f);
 int prefix_count(void);
 bool has_dup_prefix(void);
-void inject(int len);
+void execute_target(void* addr);
 bool move_next_instruction(void);
 bool move_next_range(void);
 void init_config(int argc, char** argv);
@@ -720,10 +722,9 @@ bool has_prefix(uint8_t* pre)
 	return false;
 }
 
-void inject(int len)
+void execute_target(void* addr)
 {
-	memset(arena_buffer, 0xCC, ARENA_SIZE);
-	memcpy(packet, inj.i.bytes, len);
+	current_exec_addr = addr;
 
 	if (!have_state) {
 		__asm__ __volatile__ ("ud2\n\t");
@@ -732,42 +733,54 @@ void inject(int len)
 
 	uintptr_t* stk = (uintptr_t*)dummy_stack_area;
 	for (size_t s = 0; s < sizeof(dummy_stack_area) / sizeof(uintptr_t); s++) {
-		stk[s] = (uintptr_t)packet + len;
+		stk[s] = (uintptr_t)addr + MAX_INSN_LENGTH;
 	}
 
 	__asm__ __volatile__ ("emms\n\t");
 
 #if ARCH_X64
 	__asm__ __volatile__ (
-		"movq packet(%rip), %r11 \n\t"
-		"leaq dummy_stack_area+32768(%rip), %rsp \n\t"
-		"xorq %rax, %rax \n\t"
-		"xorq %rbx, %rbx \n\t"
-		"xorq %rcx, %rcx \n\t"
-		"xorq %rdx, %rdx \n\t"
-		"xorq %rsi, %rsi \n\t"
-		"xorq %rdi, %rdi \n\t"
-		"xorq %r8,  %r8  \n\t"
-		"xorq %r9,  %r9  \n\t"
-		"xorq %r10, %r10 \n\t"
-		"xorq %r12, %r12 \n\t"
-		"xorq %r13, %r13 \n\t"
-		"xorq %r14, %r14 \n\t"
-		"xorq %r15, %r15 \n\t"
-		"xorq %rbp, %rbp \n\t"
-		"jmp *%r11 \n\t"
+		"movq %0, %%r11 \n\t"
+		"leaq dummy_stack_area+32768(%%rip), %%rsp \n\t"
+		"xorq %%rax, %%rax \n\t"
+		"xorq %%rbx, %%rbx \n\t"
+		"xorq %%rcx, %%rcx \n\t"
+		"xorq %%rdx, %%rdx \n\t"
+		"xorq %%rsi, %%rsi \n\t"
+		"xorq %%rdi, %%rdi \n\t"
+		"xorq %%r8,  %%r8  \n\t"
+		"xorq %%r9,  %%r9  \n\t"
+		"xorq %%r10, %%r10 \n\t"
+		"xorq %%r12, %%r12 \n\t"
+		"xorq %%r13, %%r13 \n\t"
+		"xorq %%r14, %%r14 \n\t"
+		"xorq %%r15, %%r15 \n\t"
+		"xorq %%rbp, %%rbp \n\t"
+		"pushfq \n\t"
+		"orq $0x100, (%%rsp) \n\t"
+		"popfq \n\t"
+		"jmp *%%r11 \n\t"
+		:
+		: "r"(addr)
+		: "memory"
 	);
 #else
 	__asm__ __volatile__ (
-		"movl packet, %edx \n\t"
-		"leal dummy_stack_area+32768, %esp \n\t"
-		"xorl %eax, %eax \n\t"
-		"xorl %ebx, %ebx \n\t"
-		"xorl %ecx, %ecx \n\t"
-		"xorl %esi, %esi \n\t"
-		"xorl %edi, %edi \n\t"
-		"xorl %ebp, %ebp \n\t"
-		"jmp *%edx \n\t"
+		"movl %0, %%edx \n\t"
+		"leal dummy_stack_area+32768, %%esp \n\t"
+		"xorl %%eax, %%eax \n\t"
+		"xorl %%ebx, %%ebx \n\t"
+		"xorl %%ecx, %%ecx \n\t"
+		"xorl %%esi, %%esi \n\t"
+		"xorl %%edi, %%edi \n\t"
+		"xorl %%ebp, %%ebp \n\t"
+		"pushfl \n\t"
+		"orl $0x100, (%%esp) \n\t"
+		"popfl \n\t"
+		"jmp *%%edx \n\t"
+		:
+		: "r"(addr)
+		: "memory"
 	);
 #endif
 
@@ -803,39 +816,35 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	uint32_t signum = 0;
 	uint32_t si_code = 0;
 	uint32_t addr = (uint32_t)-1;
-	int fault_offset = (int)(fault_ip - (uintptr_t)packet);
+	int fault_offset = (int)(fault_ip - (uintptr_t)current_exec_addr);
 	int insn_length = 0;
 
 	if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
 		signum = SIGTRAP;
 		si_code = 1;
-		insn_length = fault_offset > 0 ? fault_offset : expected_length;
+		insn_length = fault_offset > 0 ? fault_offset : 1;
 	}
 	else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION) {
 		signum = SIGILL;
 		si_code = 1;
-		insn_length = fault_offset > 0 ? fault_offset : (expected_length > 0 ? expected_length : 1);
+		insn_length = fault_offset > 0 ? fault_offset : 0;
 	}
 	else if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
 		signum = SIGSEGV;
 		si_code = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
 		addr = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-		insn_length = fault_offset > 0 ? fault_offset : (expected_length > 0 ? expected_length : 1);
+		insn_length = fault_offset > 0 ? fault_offset : 0;
 	}
 	else if (code == EXCEPTION_DATATYPE_MISALIGNMENT) {
 		signum = SIGBUS;
 		si_code = 1;
 		addr = (uint32_t)(uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionAddress;
-		insn_length = fault_offset > 0 ? fault_offset : (expected_length > 0 ? expected_length : 1);
+		insn_length = fault_offset > 0 ? fault_offset : 0;
 	}
 	else {
 		signum = SIGFPE;
 		si_code = 1;
-		insn_length = fault_offset > 0 ? fault_offset : (expected_length > 0 ? expected_length : 1);
-	}
-
-	if (insn_length <= 0 || insn_length > MAX_INSN_LENGTH) {
-		insn_length = expected_length > 0 ? expected_length : 1;
+		insn_length = fault_offset > 0 ? fault_offset : 0;
 	}
 
 	result.valid = 1;
@@ -853,6 +862,26 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 #endif
 
 	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void inject(void)
+{
+	int k;
+	for (k = 1; k <= MAX_INSN_LENGTH; k++) {
+		uint8_t* test_loc = guard_boundary - k;
+		memcpy(test_loc, inj.i.bytes, MAX_INSN_LENGTH);
+
+		execute_target(test_loc);
+
+		if (result.signum == SIGSEGV && (uintptr_t)result.addr == (uintptr_t)guard_boundary) {
+			continue;
+		}
+
+		result.length = k;
+		return;
+	}
+
+	result.length = MAX_INSN_LENGTH;
 }
 
 void get_rand_insn_in_range(range_t* r)
@@ -1213,10 +1242,17 @@ int main(int argc, char** argv)
 	pin_core();
 	srand(config.seed);
 
-	arena_buffer = VirtualAlloc(NULL, ARENA_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	arena_buffer = VirtualAlloc(NULL, ARENA_SIZE, MEM_RESERVE, PAGE_NOACCESS);
 	assert(arena_buffer != NULL);
 
-	packet = ((char*)arena_buffer) + ARENA_OFFSET;
+	void* page0 = VirtualAlloc(arena_buffer, PAGE_SIZE, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+	assert(page0 != NULL);
+
+	void* page1 = VirtualAlloc((uint8_t*)arena_buffer + PAGE_SIZE, PAGE_SIZE, MEM_COMMIT, PAGE_READWRITE);
+	assert(page1 != NULL);
+
+	packet = (char*)page0;
+	guard_boundary = ((uint8_t*)arena_buffer) + PAGE_SIZE;
 
 #if USE_CAPSTONE
 	if (cs_open(CS_ARCH_X86, CS_MODE, &capstone_handle) != CS_ERR_OK) exit(1);
@@ -1247,11 +1283,7 @@ int main(int argc, char** argv)
 #endif
 			}
 
-			int inject_len = expected_length > 0 ? expected_length : (inj.index >= 0 ? inj.index + 1 : MAX_INSN_LENGTH);
-			if (inject_len > MAX_INSN_LENGTH) inject_len = MAX_INSN_LENGTH;
-			if (inject_len < 1) inject_len = 1;
-
-			inject(inject_len);
+			inject();
 
 			if (is_branch_insn(inj.i.bytes, NULL)) {
 				result.length = expected_length;
