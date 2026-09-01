@@ -86,6 +86,7 @@ void* arena_buffer = NULL;
 char* packet = NULL;
 uint8_t* guard_boundary = NULL;
 static uint8_t dummy_stack_area[65536] __attribute__ ((aligned(4096)));
+static uint8_t scratch_area[65536] __attribute__ ((aligned(4096)));
 
 typedef struct {
 	uint8_t bytes[MAX_INSN_LENGTH];
@@ -102,6 +103,8 @@ inj_t inj;
 static const insn_t null_insn = {0};
 static CONTEXT fault_context;
 static bool have_state = false;
+static uintptr_t last_fault_addr = 0;
+static uintptr_t last_fault_ip = 0;
 
 #pragma pack(push, 1)
 typedef struct {
@@ -731,6 +734,8 @@ void execute_target(void* addr)
 		have_state = true;
 	}
 
+	uintptr_t safe_target = (uintptr_t)(scratch_area + 32768);
+
 	uintptr_t* stk = (uintptr_t*)dummy_stack_area;
 	for (size_t s = 0; s < sizeof(dummy_stack_area) / sizeof(uintptr_t); s++) {
 		stk[s] = (uintptr_t)addr + MAX_INSN_LENGTH;
@@ -741,45 +746,39 @@ void execute_target(void* addr)
 #if ARCH_X64
 	__asm__ __volatile__ (
 		"movq %0, %%r11 \n\t"
+		"movq %1, %%rax \n\t"
+		"movq %1, %%rbx \n\t"
+		"movq %1, %%rcx \n\t"
+		"movq %1, %%rdx \n\t"
+		"movq %1, %%rsi \n\t"
+		"movq %1, %%rdi \n\t"
+		"movq %1, %%rbp \n\t"
+		"movq %1, %%r8  \n\t"
+		"movq %1, %%r9  \n\t"
+		"movq %1, %%r10 \n\t"
+		"movq %1, %%r12 \n\t"
+		"movq %1, %%r13 \n\t"
+		"movq %1, %%r14 \n\t"
+		"movq %1, %%r15 \n\t"
 		"leaq dummy_stack_area+32768(%%rip), %%rsp \n\t"
-		"xorq %%rax, %%rax \n\t"
-		"xorq %%rbx, %%rbx \n\t"
-		"xorq %%rcx, %%rcx \n\t"
-		"xorq %%rdx, %%rdx \n\t"
-		"xorq %%rsi, %%rsi \n\t"
-		"xorq %%rdi, %%rdi \n\t"
-		"xorq %%r8,  %%r8  \n\t"
-		"xorq %%r9,  %%r9  \n\t"
-		"xorq %%r10, %%r10 \n\t"
-		"xorq %%r12, %%r12 \n\t"
-		"xorq %%r13, %%r13 \n\t"
-		"xorq %%r14, %%r14 \n\t"
-		"xorq %%r15, %%r15 \n\t"
-		"xorq %%rbp, %%rbp \n\t"
-		"pushfq \n\t"
-		"orq $0x100, (%%rsp) \n\t"
-		"popfq \n\t"
 		"jmp *%%r11 \n\t"
 		:
-		: "r"(addr)
+		: "r"(addr), "r"(safe_target)
 		: "memory"
 	);
 #else
 	__asm__ __volatile__ (
 		"movl %0, %%edx \n\t"
+		"movl %1, %%eax \n\t"
+		"movl %1, %%ebx \n\t"
+		"movl %1, %%ecx \n\t"
+		"movl %1, %%esi \n\t"
+		"movl %1, %%edi \n\t"
+		"movl %1, %%ebp \n\t"
 		"leal dummy_stack_area+32768, %%esp \n\t"
-		"xorl %%eax, %%eax \n\t"
-		"xorl %%ebx, %%ebx \n\t"
-		"xorl %%ecx, %%ecx \n\t"
-		"xorl %%esi, %%esi \n\t"
-		"xorl %%edi, %%edi \n\t"
-		"xorl %%ebp, %%ebp \n\t"
-		"pushfl \n\t"
-		"orl $0x100, (%%esp) \n\t"
-		"popfl \n\t"
 		"jmp *%%edx \n\t"
 		:
-		: "r"(addr)
+		: "r"(addr), "r"(safe_target)
 		: "memory"
 	);
 #endif
@@ -816,24 +815,40 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	uint32_t signum = 0;
 	uint32_t si_code = 0;
 	uint32_t addr = (uint32_t)-1;
+	uintptr_t fault_addr = 0;
 	int fault_offset = (int)(fault_ip - (uintptr_t)current_exec_addr);
 	int insn_length = 0;
 
-	if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
-		signum = SIGTRAP;
-		si_code = 1;
-		insn_length = fault_offset > 0 ? fault_offset : 1;
+	if (pExceptionInfo->ExceptionRecord->NumberParameters > 1) {
+		fault_addr = (uintptr_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
+	}
+
+	last_fault_ip = fault_ip;
+	last_fault_addr = fault_addr;
+
+	if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
+		if (fault_addr == (uintptr_t)guard_boundary && fault_ip == (uintptr_t)guard_boundary && fault_offset > 0) {
+			signum = SIGTRAP;
+			si_code = 1;
+			insn_length = fault_offset;
+			addr = 0;
+		}
+		else {
+			signum = SIGSEGV;
+			si_code = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+			addr = (uint32_t)fault_addr;
+			insn_length = fault_offset > 0 ? fault_offset : 0;
+		}
 	}
 	else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION) {
 		signum = SIGILL;
 		si_code = 1;
 		insn_length = fault_offset > 0 ? fault_offset : 0;
 	}
-	else if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
-		signum = SIGSEGV;
-		si_code = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-		addr = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-		insn_length = fault_offset > 0 ? fault_offset : 0;
+	else if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
+		signum = SIGTRAP;
+		si_code = 1;
+		insn_length = fault_offset > 0 ? fault_offset : 1;
 	}
 	else if (code == EXCEPTION_DATATYPE_MISALIGNMENT) {
 		signum = SIGBUS;
@@ -873,7 +888,7 @@ void inject(void)
 
 		execute_target(test_loc);
 
-		if (result.signum == SIGSEGV && (uintptr_t)result.addr == (uintptr_t)guard_boundary) {
+		if (result.signum == SIGSEGV && last_fault_addr == (uintptr_t)guard_boundary) {
 			continue;
 		}
 
