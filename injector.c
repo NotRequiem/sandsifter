@@ -884,7 +884,7 @@ void inject(void)
 	int k;
 	for (k = 1; k <= MAX_INSN_LENGTH; k++) {
 		uint8_t* test_loc = guard_boundary - k;
-		memcpy(test_loc, inj.i.bytes, MAX_INSN_LENGTH);
+		memcpy(test_loc, inj.i.bytes, k);
 
 		execute_target(test_loc);
 
@@ -1263,7 +1263,7 @@ int main(int argc, char** argv)
 	void* page0 = VirtualAlloc(arena_buffer, PAGE_SIZE, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 	assert(page0 != NULL);
 
-	void* page1 = VirtualAlloc((uint8_t*)arena_buffer + PAGE_SIZE, PAGE_SIZE, MEM_COMMIT, PAGE_READWRITE);
+	void* page1 = VirtualAlloc((uint8_t*)arena_buffer + PAGE_SIZE, PAGE_SIZE, MEM_COMMIT, PAGE_NOACCESS);
 	assert(page1 != NULL);
 
 	packet = (char*)page0;
