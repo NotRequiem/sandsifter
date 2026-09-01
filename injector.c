@@ -100,8 +100,9 @@ typedef struct {
 inj_t inj;
 
 static const insn_t null_insn = {0};
-static CONTEXT fault_context;
-static bool have_state = false;
+static uintptr_t saved_host_sp = 0;
+static void* target_jump_addr = NULL;
+static volatile bool in_target = false;
 
 static void* current_exec_addr = NULL;
 static uintptr_t last_fault_ip = 0;
@@ -113,7 +114,11 @@ typedef struct {
 	uint32_t length;
 	uint32_t signum;
 	uint32_t si_code;
+#if ARCH_X64
+	uint64_t addr;
+#else
 	uint32_t addr;
+#endif
 } result_t;
 
 typedef struct {
@@ -164,6 +169,9 @@ ignore_op_t opcode_blacklist[MAX_BLACKLIST] = {
 	{ (uint8_t*)"\x0f\xb5",     2, "lgs" },
 	{ (uint8_t*)"\x8e",         1, "mov seg" },
 	{ (uint8_t*)"\xcd\x29",     2, "fastfail" },
+	{ (uint8_t*)"\xcd\x2c",     2, "assert" },
+	{ (uint8_t*)"\xcd\x2d",     2, "debug service" },
+	{ (uint8_t*)"\xcd\x2e",     2, "legacy syscall" },
 	{ (uint8_t*)"\xcc",         1, "int3" },
 	{ (uint8_t*)"\xce",         1, "into" },
 	{ (uint8_t*)"\xf1",         1, "icebp" },
@@ -293,6 +301,7 @@ void sync_fwrite(const void* ptr, size_t size, size_t count, FILE* f)
 
 void sync_fflush(FILE* f, bool force)
 {
+	(void)force;
 	WaitForSingleObject(output_mutex, INFINITE);
 	fflush(f);
 	ReleaseMutex(output_mutex);
@@ -696,16 +705,12 @@ bool has_prefix(uint8_t* pre)
 	return false;
 }
 
-void execute_target(void* addr)
+__attribute__((noinline)) void execute_target(void* addr)
 {
 	current_exec_addr = addr;
+	target_jump_addr = addr;
 	last_fault_ip = 0;
 	last_fault_addr = 0;
-
-	if (!have_state) {
-		__asm__ __volatile__ ("ud2\n\t");
-		have_state = true;
-	}
 
 	uintptr_t safe_target = (uintptr_t)(scratch_area + 32768);
 
@@ -715,10 +720,35 @@ void execute_target(void* addr)
 	}
 
 	__asm__ __volatile__ ("emms\n\t");
+	__asm__ __volatile__ ("fninit\n\t");
+	uint32_t default_mxcsr = 0x1f80;
+	__asm__ __volatile__ ("ldmxcsr %0" : : "m"(default_mxcsr));
+
+	in_target = true;
 
 #if ARCH_X64
 	__asm__ __volatile__ (
-		"movq %0, %%r11 \n\t"
+		"pushq %%rbx \n\t"
+		"pushq %%rbp \n\t"
+		"pushq %%rdi \n\t"
+		"pushq %%rsi \n\t"
+		"pushq %%r12 \n\t"
+		"pushq %%r13 \n\t"
+		"pushq %%r14 \n\t"
+		"pushq %%r15 \n\t"
+		"subq $160, %%rsp \n\t"
+		"movdqu %%xmm6, 0(%%rsp) \n\t"
+		"movdqu %%xmm7, 16(%%rsp) \n\t"
+		"movdqu %%xmm8, 32(%%rsp) \n\t"
+		"movdqu %%xmm9, 48(%%rsp) \n\t"
+		"movdqu %%xmm10, 64(%%rsp) \n\t"
+		"movdqu %%xmm11, 80(%%rsp) \n\t"
+		"movdqu %%xmm12, 96(%%rsp) \n\t"
+		"movdqu %%xmm13, 112(%%rsp) \n\t"
+		"movdqu %%xmm14, 128(%%rsp) \n\t"
+		"movdqu %%xmm15, 144(%%rsp) \n\t"
+		"movq %%rsp, %0 \n\t"
+		"leaq dummy_stack_area+32760(%%rip), %%rsp \n\t"
 		"movq %1, %%rax \n\t"
 		"movq %1, %%rbx \n\t"
 		"movq %1, %%rcx \n\t"
@@ -729,37 +759,73 @@ void execute_target(void* addr)
 		"movq %1, %%r8  \n\t"
 		"movq %1, %%r9  \n\t"
 		"movq %1, %%r10 \n\t"
+		"movq %1, %%r11 \n\t"
 		"movq %1, %%r12 \n\t"
 		"movq %1, %%r13 \n\t"
 		"movq %1, %%r14 \n\t"
 		"movq %1, %%r15 \n\t"
-		"leaq dummy_stack_area+32768(%%rip), %%rsp \n\t"
-		"jmp *%%r11 \n\t"
-		:
-		: "r"(addr), "r"(safe_target)
-		: "memory"
+		"jmp *%2 \n\t"
+		".globl resume \n\t"
+		"resume: \n\t"
+		"movq %0, %%rsp \n\t"
+		"movdqu 0(%%rsp), %%xmm6 \n\t"
+		"movdqu 16(%%rsp), %%xmm7 \n\t"
+		"movdqu 32(%%rsp), %%xmm8 \n\t"
+		"movdqu 48(%%rsp), %%xmm9 \n\t"
+		"movdqu 64(%%rsp), %%xmm10 \n\t"
+		"movdqu 80(%%rsp), %%xmm11 \n\t"
+		"movdqu 96(%%rsp), %%xmm12 \n\t"
+		"movdqu 112(%%rsp), %%xmm13 \n\t"
+		"movdqu 128(%%rsp), %%xmm14 \n\t"
+		"movdqu 144(%%rsp), %%xmm15 \n\t"
+		"addq $160, %%rsp \n\t"
+		"popq %%r15 \n\t"
+		"popq %%r14 \n\t"
+		"popq %%r13 \n\t"
+		"popq %%r12 \n\t"
+		"popq %%rsi \n\t"
+		"popq %%rdi \n\t"
+		"popq %%rbp \n\t"
+		"popq %%rbx \n\t"
+		"emms \n\t"
+		"fninit \n\t"
+		: "=m"(saved_host_sp)
+		: "r"(safe_target), "m"(target_jump_addr)
+		: "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
+		  "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory"
 	);
 #else
 	__asm__ __volatile__ (
-		"movl %0, %%edx \n\t"
+		"pushl %%ebx \n\t"
+		"pushl %%esi \n\t"
+		"pushl %%edi \n\t"
+		"pushl %%ebp \n\t"
+		"movl %%esp, %0 \n\t"
+		"leal dummy_stack_area+32764, %%esp \n\t"
 		"movl %1, %%eax \n\t"
 		"movl %1, %%ebx \n\t"
 		"movl %1, %%ecx \n\t"
+		"movl %1, %%edx \n\t"
 		"movl %1, %%esi \n\t"
 		"movl %1, %%edi \n\t"
 		"movl %1, %%ebp \n\t"
-		"leal dummy_stack_area+32768, %%esp \n\t"
-		"jmp *%%edx \n\t"
-		:
-		: "r"(addr), "r"(safe_target)
-		: "memory"
+		"jmp *%2 \n\t"
+		".globl resume \n\t"
+		"resume: \n\t"
+		"movl %0, %%esp \n\t"
+		"popl %%ebp \n\t"
+		"popl %%edi \n\t"
+		"popl %%esi \n\t"
+		"popl %%ebx \n\t"
+		"emms \n\t"
+		"fninit \n\t"
+		: "=m"(saved_host_sp)
+		: "r"(safe_target), "m"(target_jump_addr)
+		: "eax", "ecx", "edx", "memory"
 	);
 #endif
 
-	__asm__ __volatile__ (
-		".globl resume \n\t"
-		"resume:       \n\t"
-	);
+	in_target = false;
 }
 
 void inject(void)
@@ -770,23 +836,27 @@ void inject(void)
 	for (len = 1; len <= MAX_INSN_LENGTH; len++) {
 		uint8_t* test_loc = page_boundary - len;
 
-		// Copy candidate bytes directly to the boundary of Page 0
 		memcpy(test_loc, inj.i.bytes, len);
-
-		// Execute from test_loc
 		execute_target(test_loc);
 
 		last_res = result;
 
-		// If the CPU faulted during instruction fetch across the PAGE_NOACCESS boundary,
-		// the instruction requires more than len bytes to decode.
+#if ARCH_X64
 		if (result.signum == SIGSEGV && 
+		    result.si_code == 8 && 
 		    last_fault_addr == (uintptr_t)page_boundary && 
 		    last_fault_ip < (uintptr_t)page_boundary) {
 			continue;
 		}
+#else
+		if (result.signum == SIGSEGV && 
+		    (result.si_code == 8 || (!config.nx_support && result.si_code == 0)) && 
+		    last_fault_addr == (uintptr_t)page_boundary && 
+		    last_fault_ip < (uintptr_t)page_boundary) {
+			continue;
+		}
+#endif
 
-		// The CPU decoded the instruction within len bytes
 		result = last_res;
 		result.length = len;
 		result.valid = 1;
@@ -800,19 +870,14 @@ void inject(void)
 
 LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 {
-	__asm__ __volatile__ ("emms\n\t");
-
-	if (!have_state) {
-		fault_context = *pExceptionInfo->ContextRecord;
-		fault_context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-#if ARCH_X64
-		pExceptionInfo->ContextRecord->Rip += UD2_SIZE;
-#else
-		pExceptionInfo->ContextRecord->Eip += UD2_SIZE;
-#endif
-		have_state = true;
-		return EXCEPTION_CONTINUE_EXECUTION;
+	if (!in_target) {
+		return EXCEPTION_CONTINUE_SEARCH;
 	}
+
+	__asm__ __volatile__ ("emms\n\t");
+	__asm__ __volatile__ ("fninit\n\t");
+	uint32_t default_mxcsr = 0x1f80;
+	__asm__ __volatile__ ("ldmxcsr %0" : : "m"(default_mxcsr));
 
 #if ARCH_X64
 	uintptr_t fault_ip = (uintptr_t)pExceptionInfo->ContextRecord->Rip;
@@ -823,7 +888,7 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	DWORD code = pExceptionInfo->ExceptionRecord->ExceptionCode;
 	uint32_t signum = 0;
 	uint32_t si_code = 0;
-	uint32_t addr = (uint32_t)-1;
+	uintptr_t addr = (uintptr_t)-1;
 	uintptr_t fault_addr = 0;
 
 	if (pExceptionInfo->ExceptionRecord->NumberParameters > 1) {
@@ -833,41 +898,47 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	last_fault_ip = fault_ip;
 	last_fault_addr = fault_addr;
 
-	if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
-		// If fault_ip >= page_boundary, the instruction finished executing
-		// and reached or jumped into the PAGE_NOACCESS guard page.
-		if (fault_ip >= (uintptr_t)page_boundary) {
-			signum = SIGTRAP;
-			si_code = 1;
-			addr = 0;
+	if (code == EXCEPTION_SINGLE_STEP || code == EXCEPTION_BREAKPOINT) {
+		signum = SIGTRAP;
+		si_code = 1;
+		addr = fault_ip;
+	}
+	else if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
+		uint32_t access_type = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+		
+		if (access_type == 8) {
+			if ((fault_ip >= (uintptr_t)page_boundary && fault_ip < (uintptr_t)page_boundary + page_size) ||
+			    (fault_ip >= (uintptr_t)scratch_area && fault_ip < (uintptr_t)scratch_area + sizeof(scratch_area))) {
+				signum = SIGTRAP;
+				si_code = 1;
+				addr = 0;
+			}
+			else {
+				signum = SIGSEGV;
+				si_code = 8;
+				addr = fault_addr;
+			}
 		}
-		// If fault_ip < page_boundary, this was either an instruction-fetch fault during decode
-		// (if fault_addr == page_boundary) or a memory operand fault.
 		else {
 			signum = SIGSEGV;
-			si_code = (uint32_t)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-			addr = (uint32_t)fault_addr;
+			si_code = access_type;
+			addr = fault_addr;
 		}
 	}
 	else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION) {
 		signum = SIGILL;
 		si_code = 1;
-		addr = (uint32_t)fault_ip;
-	}
-	else if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
-		signum = SIGTRAP;
-		si_code = 1;
-		addr = (uint32_t)fault_ip;
+		addr = fault_ip;
 	}
 	else if (code == EXCEPTION_DATATYPE_MISALIGNMENT) {
 		signum = SIGBUS;
 		si_code = 1;
-		addr = (uint32_t)fault_addr;
+		addr = fault_addr;
 	}
 	else {
 		signum = SIGFPE;
 		si_code = 1;
-		addr = (uint32_t)fault_ip;
+		addr = fault_ip;
 	}
 
 	result.valid = 1;
@@ -876,12 +947,12 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	result.si_code = si_code;
 	result.addr = addr;
 
-	*pExceptionInfo->ContextRecord = fault_context;
-	pExceptionInfo->ContextRecord->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
 #if ARCH_X64
 	pExceptionInfo->ContextRecord->Rip = (uintptr_t)&resume;
+	pExceptionInfo->ContextRecord->Rsp = saved_host_sp;
 #else
 	pExceptionInfo->ContextRecord->Eip = (uintptr_t)&resume;
+	pExceptionInfo->ContextRecord->Esp = saved_host_sp;
 #endif
 
 	return EXCEPTION_CONTINUE_EXECUTION;
@@ -1096,7 +1167,11 @@ void give_result(FILE* f)
 					if (result.signum == SIGBUS)  { sync_fprintf(f, "sigbus "); }
 					if (result.signum == SIGTRAP) { sync_fprintf(f, "sigtrap"); }
 					sync_fprintf(f, " %3d ", result.si_code);
+#if ARCH_X64
+					sync_fprintf(f, " %016llx ", (unsigned long long)result.addr);
+#else
 					sync_fprintf(f, " %08x ", result.addr);
+#endif
 					print_mc(f, result.length);
 					sync_fprintf(f, "\n");
 					break;
@@ -1250,17 +1325,17 @@ int main(int argc, char** argv)
 	page_size = si.dwPageSize;
 	if (page_size < 4096) page_size = 4096;
 
-	// 2 Contiguous Pages: Page 0 (RWX) and Page 1 (PAGE_NOACCESS)
-	page_boundary_buffer = VirtualAlloc(NULL, 2 * page_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	if (config.enable_null_access) {
+		VirtualAlloc((void*)1, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	}
+
+	page_boundary_buffer = VirtualAlloc(NULL, 2 * page_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	assert(page_boundary_buffer != NULL);
 
-	DWORD old_protect;
-	BOOL ok1 = VirtualProtect(page_boundary_buffer, page_size, PAGE_EXECUTE_READWRITE, &old_protect);
-	assert(ok1);
-
 	page_boundary = (uint8_t*)page_boundary_buffer + page_size;
-	BOOL ok2 = VirtualProtect(page_boundary, page_size, PAGE_NOACCESS, &old_protect);
-	assert(ok2);
+	DWORD old_protect;
+	BOOL ok = VirtualProtect(page_boundary, page_size, PAGE_NOACCESS, &old_protect);
+	assert(ok);
 
 	packet = (char*)(page_boundary - MAX_INSN_LENGTH);
 
@@ -1275,17 +1350,8 @@ int main(int argc, char** argv)
 
 	while (move_next_range()) {
 		while (move_next_instruction()) {
-			pretext();
-
 			expected_length = 0;
-#if USE_CAPSTONE
-			uint8_t* code = inj.i.bytes;
-			size_t code_size = MAX_INSN_LENGTH;
-			uint64_t address = (uintptr_t)packet;
-			if (cs_disasm_iter(capstone_handle, (const uint8_t**)&code, &code_size, &address, capstone_insn)) {
-				expected_length = (int)(address - (uintptr_t)packet);
-			}
-#endif
+			pretext();
 
 			inject();
 
