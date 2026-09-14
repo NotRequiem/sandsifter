@@ -92,8 +92,7 @@ typedef struct {
 inj_t inj;
 
 static const insn_t null_insn = {0};
-static uintptr_t saved_host_sp = 0;
-static void* target_jump_addr = NULL;
+uintptr_t saved_host_sp = 0;
 static volatile bool in_target = false;
 static volatile bool last_fault_was_fetch = false;
 static int expected_length = 0;
@@ -627,12 +626,10 @@ bool has_prefix(uint8_t* pre)
 
 __attribute__((noinline)) void execute_target(void* addr)
 {
-	target_jump_addr = addr;
-
 	uintptr_t safe_target = (uintptr_t)(scratch_area + 32768);
 	uintptr_t* stk = (uintptr_t*)dummy_stack_area;
 	for (size_t s = 0; s < sizeof(dummy_stack_area) / sizeof(uintptr_t); s++) {
-		stk[s] = (uintptr_t)safe_target;
+		stk[s] = safe_target;
 	}
 
 	__asm__ __volatile__ ("cld\n\t");
@@ -665,32 +662,31 @@ __attribute__((noinline)) void execute_target(void* addr)
 		"movdqu %%xmm14, 128(%%rsp) \n\t"
 		"movdqu %%xmm15, 144(%%rsp) \n\t"
 		"movq %%rsp, %0 \n\t"
-		"leaq dummy_stack_area+32760(%%rip), %%rsp \n\t"
-		"movq %1, %%rax \n\t"
-		"movq %1, %%rbx \n\t"
-		"movq %1, %%rcx \n\t"
-		"movq %1, %%rdx \n\t"
-		"movq %1, %%rsi \n\t"
-		"movq %1, %%rdi \n\t"
-		"movq %1, %%rbp \n\t"
-		"movq %1, %%r8  \n\t"
-		"movq %1, %%r9  \n\t"
-		"movq %1, %%r12 \n\t"
-		"movq %1, %%r13 \n\t"
-		"movq %1, %%r14 \n\t"
-		"movq %1, %%r15 \n\t"
-		"movq %%rsp, %%r10 \n\t"
-		"subq $8, %%r10 \n\t"
+		"leaq dummy_stack_area+32752(%%rip), %%rsp \n\t"
 		"movq %%ss, %%r11 \n\t"
 		"pushq %%r11 \n\t"
-		"pushq %%r10 \n\t"
+		"pushq %%rsp \n\t"
+		"addq $8, (%%rsp) \n\t"
 		"pushfq \n\t"
 		"orq $0x100, (%%rsp) \n\t"
 		"movq %%cs, %%r11 \n\t"
 		"pushq %%r11 \n\t"
-		"pushq %2 \n\t"
+		"pushq %1 \n\t"
+		"leaq scratch_area+32768(%%rip), %%rax \n\t"
+		"movq %%rax, %%rbx \n\t"
+		"movq %%rax, %%rcx \n\t"
+		"movq %%rax, %%rdx \n\t"
+		"movq %%rax, %%rsi \n\t"
+		"movq %%rax, %%rdi \n\t"
+		"movq %%rax, %%rbp \n\t"
+		"movq %%rax, %%r8  \n\t"
+		"movq %%rax, %%r9  \n\t"
 		"movq %%rax, %%r10 \n\t"
 		"movq %%rax, %%r11 \n\t"
+		"movq %%rax, %%r12 \n\t"
+		"movq %%rax, %%r13 \n\t"
+		"movq %%rax, %%r14 \n\t"
+		"movq %%rax, %%r15 \n\t"
 		"iretq \n\t"
 		".globl resume \n\t"
 		"resume: \n\t"
@@ -719,7 +715,7 @@ __attribute__((noinline)) void execute_target(void* addr)
 		"fninit \n\t"
 		"cld \n\t"
 		: "=m"(saved_host_sp)
-		: "r"(safe_target), "r"(target_jump_addr)
+		: "r"(addr)
 		: "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
 		  "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory"
 	);
@@ -731,18 +727,18 @@ __attribute__((noinline)) void execute_target(void* addr)
 		"pushl %%ebp \n\t"
 		"movl %%esp, %0 \n\t"
 		"leal dummy_stack_area+32764, %%esp \n\t"
-		"movl %1, %%eax \n\t"
-		"movl %1, %%ebx \n\t"
-		"movl %1, %%ecx \n\t"
-		"movl %1, %%esi \n\t"
-		"movl %1, %%edi \n\t"
-		"movl %1, %%ebp \n\t"
 		"pushfl \n\t"
 		"orl $0x100, (%%esp) \n\t"
 		"movl %%cs, %%edx \n\t"
 		"pushl %%edx \n\t"
-		"pushl %2 \n\t"
+		"pushl %1 \n\t"
+		"leal scratch_area+32768, %%eax \n\t"
+		"movl %%eax, %%ebx \n\t"
+		"movl %%eax, %%ecx \n\t"
 		"movl %%eax, %%edx \n\t"
+		"movl %%eax, %%esi \n\t"
+		"movl %%eax, %%edi \n\t"
+		"movl %%eax, %%ebp \n\t"
 		"iretd \n\t"
 		".globl resume \n\t"
 		"resume: \n\t"
@@ -756,7 +752,7 @@ __attribute__((noinline)) void execute_target(void* addr)
 		"fninit \n\t"
 		"cld \n\t"
 		: "=m"(saved_host_sp)
-		: "r"(safe_target), "r"(target_jump_addr)
+		: "r"(addr)
 		: "eax", "ecx", "edx", "memory"
 	);
 #endif
@@ -794,6 +790,7 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	}
 
 	if (code == EXCEPTION_ACCESS_VIOLATION && 
+	    fault_ip < (uintptr_t)page_boundary && 
 	    (access_type == 8 || (fault_addr >= (uintptr_t)page_boundary && fault_addr < (uintptr_t)(page_boundary + 4096)))) {
 		last_fault_was_fetch = true;
 	}
@@ -804,7 +801,8 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 		uint32_t si_code = 0;
 		uintptr_t addr = 0;
 
-		if (code == EXCEPTION_SINGLE_STEP) {
+		if (code == EXCEPTION_SINGLE_STEP || 
+		    (code == EXCEPTION_ACCESS_VIOLATION && fault_ip >= (uintptr_t)page_boundary)) {
 			signum = SIGTRAP;
 			si_code = 1;
 			addr = 0;
