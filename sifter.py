@@ -9,7 +9,6 @@ from capstone import *
 from collections import deque
 import threading
 import time
-import curses
 from binascii import hexlify
 import re
 import random
@@ -17,8 +16,28 @@ import argparse
 import copy
 from ctypes import *
 
+try:
+    import curses
+except ImportError:
+    sys.exit("Error: 'windows-curses' is required on Windows. Run: pip install windows-curses")
+
 INJECTOR = os.path.abspath("./injector.exe")
-arch = "64" if struct.calcsize("P") * 8 == 64 else "32"
+
+def get_injector_arch(exe_path):
+    try:
+        with open(exe_path, "rb") as f:
+            data = f.read(1024)
+            pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+            machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
+            if machine == 0x8664:
+                return "64"
+            elif machine == 0x014C:
+                return "32"
+    except Exception:
+        pass
+    return "64" if struct.calcsize("P") * 8 == 64 else "32"
+
+arch = get_injector_arch(INJECTOR)
 OUTPUT = "./data/"
 LOG = OUTPUT + "log"
 SYNC = OUTPUT + "sync"
