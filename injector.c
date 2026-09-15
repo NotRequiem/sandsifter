@@ -549,9 +549,26 @@ bool modifies_sp(const uint8_t* b)
 	    op == 0x9c || op == 0x9d || op == 0xc2 || op == 0xc3 || 
 	    op == 0xc8 || op == 0xc9 || op == 0xca || op == 0xcb || 
 	    op == 0xcc || op == 0xcd || op == 0xce || op == 0xcf || 
-	    op == 0xe8 || op == 0xbc || op == 0x9a) {
+	    op == 0xe8 || op == 0xbc || op == 0x9a || op == 0x94 || 
+	    op == 0x8f) {
 		return true;
 	}
+
+	if (idx + 1 < MAX_INSN_LENGTH) {
+		uint8_t modrm = b[idx + 1];
+		uint8_t mod = (modrm >> 6) & 0x03;
+		uint8_t reg = (modrm >> 3) & 0x07;
+		uint8_t rm  = modrm & 0x07;
+
+		if ((op == 0x8b || op == 0x8d || op == 0x87) && reg == 4) return true;
+		if (mod == 3 && rm == 4) {
+			if (op == 0x89 || op == 0x87 || op == 0x81 || op == 0x83 ||
+			    op == 0x01 || op == 0x09 || op == 0x21 || op == 0x29 || op == 0x31) {
+				return true;
+			}
+		}
+	}
+
 	return false;
 }
 
@@ -1032,10 +1049,25 @@ bool move_next_instruction(void)
 			continue;
 		}
 
+#if USE_CAPSTONE
+		update_disas();
+		if (disas.val && capstone_insn->detail) {
+			bool writes_sp = false;
+			for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
+				uint16_t reg = capstone_insn->detail->regs_write[r];
+				if (reg == X86_REG_RSP || reg == X86_REG_ESP || reg == X86_REG_SP) {
+					writes_sp = true;
+					break;
+				}
+			}
+			if (writes_sp) continue; 
+		}
+#endif
+
 		if (memcmp(inj.i.bytes, search_range.end.bytes, sizeof(inj.i.bytes)) >= 0) {
 			return false;
 		}
-
+		
 		switch (mode) {
 			case RAND:   return true;
 			case BRUTE:  return inj.index >= 0;
@@ -1213,9 +1245,9 @@ int main(int argc, char** argv)
 
 	while (move_next_range()) {
 		while (move_next_instruction()) {
-#if USE_CAPSTONE
-			update_disas();
-#endif
+// #if USE_CAPSTONE
+	//		update_disas();
+// #endif
 			pretext();
 			inject();
 			give_result(stdout);
