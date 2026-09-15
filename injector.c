@@ -157,6 +157,9 @@ ignore_op_t opcode_blacklist[MAX_BLACKLIST] = {
 	{ (uint8_t*)"\x0f\xb4",     2, "lfs" },
 	{ (uint8_t*)"\x0f\xb5",     2, "lgs" },
 	{ (uint8_t*)"\x8e",         1, "mov seg" },
+	{ (uint8_t*)"\x17",         1, "pop ss" },
+	{ (uint8_t*)"\x1f",         1, "pop ds" },
+	{ (uint8_t*)"\x07",         1, "pop es" },
 	{ (uint8_t*)"\xcd\x29",     2, "fastfail" },
 	{ (uint8_t*)"\xcd\x2c",     2, "assert" },
 	{ (uint8_t*)"\xcd\x2d",     2, "debug service" },
@@ -203,7 +206,11 @@ static int optind = 1;
 static int opterr = 1;
 static int optopt = '?';
 
+#if !ARCH_X64 && defined(_WIN32)
+extern char resume asm("resume");
+#else
 extern char resume;
+#endif
 
 bool is_prefix(uint8_t x);
 bool has_opcode(const uint8_t* op, int op_len);
@@ -321,6 +328,7 @@ bool increment_range(insn_t* insn, int marker)
 
 void initialize_ranges(void)
 {
+	WaitForSingleObject(pool_mutex, INFINITE);
 	if (range_marker == NULL) {
 		char map_name[128];
 		snprintf(map_name, sizeof(map_name), "Local\\SandsifterRange_%ld", config.seed);
@@ -336,6 +344,7 @@ void initialize_ranges(void)
 			*range_marker = total_range.start;
 		}
 	}
+	ReleaseMutex(pool_mutex);
 }
 
 void free_ranges(void)
@@ -738,7 +747,6 @@ __attribute__((noinline)) void execute_target(void* addr)
 		".globl resume \n\t"
 		"resume: \n\t"
 		"cld \n\t"
-		"movq %0, %%rsp \n\t"
 		"movdqu 0(%%rsp), %%xmm6 \n\t"
 		"movdqu 16(%%rsp), %%xmm7 \n\t"
 		"movdqu 32(%%rsp), %%xmm8 \n\t"
@@ -790,7 +798,6 @@ __attribute__((noinline)) void execute_target(void* addr)
 		".globl resume \n\t"
 		"resume: \n\t"
 		"cld \n\t"
-		"movl %0, %%esp \n\t"
 		"popl %%ebp \n\t"
 		"popl %%edi \n\t"
 		"popl %%esi \n\t"
@@ -809,9 +816,11 @@ __attribute__((noinline)) void execute_target(void* addr)
 
 LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 {
-	if (!in_target) {
+	static volatile bool in_veh = false;
+	if (!in_target || in_veh) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
+	in_veh = true;
 
 	__asm__ __volatile__ ("cld\n\t");
 	__asm__ __volatile__ ("emms\n\t");
@@ -928,6 +937,7 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 	pExceptionInfo->ContextRecord->FloatSave.StatusWord  = 0x0000;
 #endif
 
+	in_veh = false;
 	return EXCEPTION_CONTINUE_EXECUTION;
 }
 
@@ -1275,9 +1285,6 @@ int main(int argc, char** argv)
 
 	while (move_next_range()) {
 		while (move_next_instruction()) {
-// #if USE_CAPSTONE
-	//		update_disas();
-// #endif
 			pretext();
 			inject();
 			give_result(stdout);
