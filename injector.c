@@ -572,6 +572,36 @@ bool modifies_sp(const uint8_t* b)
 	return false;
 }
 
+#if USE_CAPSTONE
+bool cs_touches_sp(void)
+{
+	if (disas.val && capstone_insn->detail) {
+		if (capstone_insn->id == X86_INS_FLDENV || 
+		    capstone_insn->id == X86_INS_FRSTOR || 
+		    capstone_insn->id == X86_INS_FLDCW) {
+			return true;
+		}
+
+		for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
+			uint16_t reg = capstone_insn->detail->regs_write[r];
+			if (reg == X86_REG_RSP || reg == X86_REG_ESP || reg == X86_REG_SP) {
+				return true;
+			}
+		}
+
+		for (int o = 0; o < capstone_insn->detail->x86.op_count; o++) {
+			cs_x86_op* op = &capstone_insn->detail->x86.operands[o];
+			if (op->type == X86_OP_REG) {
+				if (op->reg == X86_REG_RSP || op->reg == X86_REG_ESP || op->reg == X86_REG_SP) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+#endif
+
 void print_mc(FILE* f, int length)
 {
 	int i;
@@ -885,9 +915,17 @@ LONG WINAPI veh_handler(PEXCEPTION_POINTERS pExceptionInfo)
 #if ARCH_X64
 	pExceptionInfo->ContextRecord->Rip = (uintptr_t)&resume;
 	pExceptionInfo->ContextRecord->Rsp = saved_host_sp;
+
+	pExceptionInfo->ContextRecord->FltSave.ControlWord = 0x037f;
+	pExceptionInfo->ContextRecord->FltSave.StatusWord  = 0x0000;
+	pExceptionInfo->ContextRecord->FltSave.MxCsr       = 0x1f80;
+	pExceptionInfo->ContextRecord->MxCsr               = 0x1f80;
 #else
 	pExceptionInfo->ContextRecord->Eip = (uintptr_t)&resume;
 	pExceptionInfo->ContextRecord->Esp = saved_host_sp;
+
+	pExceptionInfo->ContextRecord->FloatSave.ControlWord = 0x037f;
+	pExceptionInfo->ContextRecord->FloatSave.StatusWord  = 0x0000;
 #endif
 
 	return EXCEPTION_CONTINUE_EXECUTION;
@@ -1051,16 +1089,8 @@ bool move_next_instruction(void)
 
 #if USE_CAPSTONE
 		update_disas();
-		if (disas.val && capstone_insn->detail) {
-			bool writes_sp = false;
-			for (int r = 0; r < capstone_insn->detail->regs_write_count; r++) {
-				uint16_t reg = capstone_insn->detail->regs_write[r];
-				if (reg == X86_REG_RSP || reg == X86_REG_ESP || reg == X86_REG_SP) {
-					writes_sp = true;
-					break;
-				}
-			}
-			if (writes_sp) continue; 
+		if (cs_touches_sp()) {
+			continue;
 		}
 #endif
 
