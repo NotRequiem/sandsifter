@@ -71,6 +71,62 @@ Details of the results can be found in the project
 Sandsifter requires first installing the Capstone disassembler:
 http://www.capstone-engine.org/.
 
+This tool requires a C99-compliant compiler with support for GNU inline assembly (`__asm__`) targeting Windows. 
+
+> **Note:** Microsoft Visual C++ (MSVC) is **not** supported for 64-bit builds because MSVC does not allow inline assembly on x64. Use a GCC-based toolchain such as **w64devkit** or **MinGW-w64**.
+
+---
+
+## 1. Prerequisites
+
+1. **Compiler:**
+   * [w64devkit](https://github.com/skeeto/w64devkit) (recommended, all the tests for this fuzzer were done on this environment) or **MinGW-w64** via MSYS2.
+2. **Capstone Disassembly Framework:**
+   * Header files (`capstone/capstone.h`)
+   * Dynamic library (`capstone.dll`) matching your target architecture (x86 or x86_64).
+
+---
+
+## 2. Directory Setup
+
+Make sure the Capstone headers and runtime DLL are accessible in your project directory:
+
+```text
+your-project/
+├── injector.c
+├── capstone.dll
+└── include/
+    └── capstone/
+        ├── capstone.h
+        ├── x86.h
+        └── ...
+```
+
+---
+
+## 3. Compilation
+
+Open your terminal or `w64devkit` shell in the project folder and run:
+
+### Recommended (w64devkit / GCC)
+```bash
+gcc -O2 -Iinclude -I. injector.c capstone.dll -o injector.exe
+```
+It does not matter if you allow O2 optimizations or not, it will not break the fuzzer. 
+
+### Alternative
+If you have an import library (`libcapstone.a` or `capstone.lib`), or if you prefer using `-L` and `-l`:
+```bash
+gcc -O2 -Iinclude -I. -L. injector.c -lcapstone -o injector.exe
+```
+
+---
+
+## 4. Architecture Notes
+
+* **64-bit (x86_64):** Default when using a 64-bit GCC toolchain. Ensure `capstone.dll` is also 64-bit.
+* **32-bit (i686):** Use a 32-bit MinGW toolchain (or `gcc -m32` if multilib is configured) and pair it with a 32-bit `capstone.dll`.
+
 ### Flags
 
 Flags are passed to the sifter with --flag, and to the injector with -- -f.
